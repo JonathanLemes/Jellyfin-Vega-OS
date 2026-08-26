@@ -2,7 +2,7 @@ import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {ScrollView, StyleSheet, Text, View} from 'react-native';
 import {Button} from '../components/Button';
 import {JellyfinLogo} from '../components/JellyfinLogo';
-import {Screen} from '../components/Screen';
+import {Screen, SplashView} from '../components/Screen';
 import {TextField} from '../components/TextField';
 import {
   authenticateByName,
@@ -14,6 +14,7 @@ import {
   probeServer,
 } from '../api/jellyfin';
 import {useApp} from '../state/AppContext';
+import {loadCredentials, saveCredentials} from '../state/storage';
 import {colors, radius, spacing, typography} from '../theme/theme';
 import type {PublicSystemInfo} from '../api/types';
 
@@ -42,15 +43,19 @@ export const ConnectScreen = () => {
   const [quickConnectCode, setQuickConnectCode] = useState<string | undefined>();
   const [quickConnectAvailable, setQuickConnectAvailable] = useState(false);
   const quickConnectSecret = useRef<string | undefined>(undefined);
+  /** True while replaying remembered credentials, before showing the form. */
+  const [restoring, setRestoring] = useState(true);
+  // Ensures the remembered sign-in is only attempted once per mount.
+  const autoAttempted = useRef(false);
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (rawAddress?: string) => {
     if (!identity) {
       return;
     }
     setBusy(true);
     setError(undefined);
     try {
-      const {serverUrl: url, info} = await probeServer(address, identity);
+      const {serverUrl: url, info} = await probeServer(rawAddress ?? address, identity);
       setServerUrl(url);
       setServerInfo(info);
       setStep('credentials');
@@ -90,6 +95,9 @@ export const ConnectScreen = () => {
         password,
         serverInfo,
       );
+      // Remembered so the next launch can sign in without the on-screen
+      // keyboard. See the note on `RememberedCredentials` about the password.
+      await saveCredentials({serverUrl, userName: username.trim(), password});
       await signIn(session);
     } catch (err) {
       setError((err as Error).message);
@@ -97,6 +105,64 @@ export const ConnectScreen = () => {
       setBusy(false);
     }
   }, [identity, password, serverInfo, serverUrl, signIn, username]);
+
+  /**
+   * Replays remembered credentials on launch.
+   *
+   * Only a complete set is replayed; a partial record just pre-fills the form
+   * so the user finishes with the fewest possible keystrokes.
+   */
+  useEffect(() => {
+    if (!identity || autoAttempted.current) {
+      return;
+    }
+    autoAttempted.current = true;
+    let cancelled = false;
+
+    (async () => {
+      const saved = await loadCredentials();
+      if (cancelled || !saved) {
+        setRestoring(false);
+        return;
+      }
+      setAddress(saved.serverUrl);
+      setUsername(saved.userName);
+      if (saved.password) {
+        setPassword(saved.password);
+      }
+
+      if (!saved.password) {
+        setRestoring(false);
+        return;
+      }
+      try {
+        const {serverUrl: url, info} = await probeServer(saved.serverUrl, identity);
+        if (cancelled) {
+          return;
+        }
+        const session = await authenticateByName(
+          url,
+          identity,
+          saved.userName,
+          saved.password,
+          info,
+        );
+        if (!cancelled) {
+          await signIn(session);
+        }
+      } catch {
+        // The server moved or the password changed: fall through to the form,
+        // which is already pre-filled with what was remembered.
+        if (!cancelled) {
+          setRestoring(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [identity, signIn]);
 
   const startQuickConnect = useCallback(async () => {
     if (!identity) {
@@ -146,6 +212,14 @@ export const ConnectScreen = () => {
     };
   }, [identity, quickConnectCode, serverInfo, serverUrl, signIn]);
 
+  if (restoring) {
+    return (
+      <Screen>
+        <SplashView />
+      </Screen>
+    );
+  }
+
   return (
     <Screen>
       <ScrollView contentContainerStyle={styles.content}>
@@ -165,7 +239,7 @@ export const ConnectScreen = () => {
               autoFocus
               label="Server address"
               onChangeText={setAddress}
-              onSubmit={connect}
+              onSubmit={() => connect()}
               placeholder="192.168.1.10:8096"
               value={address}
             />
@@ -174,7 +248,7 @@ export const ConnectScreen = () => {
               disabled={!address.trim()}
               label="Connect"
               loading={busy}
-              onPress={connect}
+              onPress={() => connect()}
               style={styles.action}
               variant="primary"
             />

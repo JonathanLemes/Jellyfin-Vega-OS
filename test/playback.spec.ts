@@ -22,7 +22,9 @@ describe('resolveStream', () => {
     const result = resolveStream(session, '1', info);
     expect(result.isDirect).toBe(false);
     expect(result.playMethod).toBe('Transcode');
-    expect(result.url).toBe('http://jf:8096/videos/1/master.m3u8?x=1&api_key=token');
+    expect(result.url).toBe(
+      'http://jf:8096/videos/1/master.m3u8?x=1&api_key=token&SegmentContainer=mp4',
+    );
   });
 
   it('appends the token to the transcoding URL', () => {
@@ -32,6 +34,21 @@ describe('resolveStream', () => {
       MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8?VideoCodec=h264'}],
     };
     expect(resolveStream(session, '1', info).url).toContain('api_key=token');
+  });
+
+  it('requests fragmented-MP4 segments, which is all MSE can consume', () => {
+    const info: PlaybackInfoResponse = {
+      MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8?x=1'}],
+    };
+    expect(resolveStream(session, '1', info).url).toContain('SegmentContainer=mp4');
+  });
+
+  it('does not override a segment container the server already chose', () => {
+    const info: PlaybackInfoResponse = {
+      MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8?SegmentContainer=ts'}],
+    };
+    const url = resolveStream(session, '1', info).url;
+    expect(url.match(/SegmentContainer=/g)).toHaveLength(1);
   });
 
   it('does not duplicate a token the server already included', () => {
@@ -48,7 +65,7 @@ describe('resolveStream', () => {
       MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8'}],
     };
     expect(resolveStream(session, '1', info).url).toBe(
-      'http://jf:8096/videos/1/master.m3u8?api_key=token',
+      'http://jf:8096/videos/1/master.m3u8?api_key=token&SegmentContainer=mp4',
     );
   });
 

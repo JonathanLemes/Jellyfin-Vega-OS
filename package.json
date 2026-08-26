@@ -21,7 +21,6 @@
     "release": "npm-run-all lint test build:app"
   },
   "dependencies": {
-    "@amazon-devices/kepler-file-system": "~0.0.7",
     "@amazon-devices/kepler-system-info": "~1.0.5",
     "@amazon-devices/react-native-kepler": "~4.0.0",
     "@amazon-devices/react-native-svg": "~3.0.9000000000",

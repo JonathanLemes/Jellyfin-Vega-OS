@@ -191,10 +191,13 @@ export class JellyfinApi {
         audioStreamIndex: options.audioStreamIndex,
         subtitleStreamIndex: options.subtitleStreamIndex,
         maxStreamingBitrate: options.maxStreamingBitrate ?? options.profile.MaxStreamingBitrate,
-        // Transcoding must stay enabled: without it the server returns a
-        // direct-play source for media the device cannot actually decode.
-        enableDirectPlay: true,
-        enableDirectStream: true,
+        // Direct play is deliberately refused. Vega OS will not open a media
+        // URL, so playback goes through Media Source Extensions, and MSE can
+        // only be fed fragmented MP4 -- which the server produces as HLS.
+        // Stream copy stays enabled, so a compatible file is remuxed rather
+        // than re-encoded and the server does very little work.
+        enableDirectPlay: false,
+        enableDirectStream: false,
         enableTranscoding: true,
         allowVideoStreamCopy: true,
         allowAudioStreamCopy: true,
@@ -388,11 +391,17 @@ export function resolveStream(
     // player fetches the playlist itself and cannot attach an Authorization
     // header, so an untouched URL answers 401 and playback fails with a bare
     // decode error. Segments listed inside the manifest already carry the key.
-    const separator = source.TranscodingUrl.includes('?') ? '&' : '?';
-    const needsKey = !/[?&]api_key=/.test(source.TranscodingUrl);
-    const url =
-      `${session.serverUrl}${source.TranscodingUrl}` +
-      (needsKey ? `${separator}api_key=${encodeURIComponent(session.accessToken)}` : '');
+    let path = source.TranscodingUrl;
+    if (!/[?&]api_key=/.test(path)) {
+      path += `${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(session.accessToken)}`;
+    }
+    // Force fragmented-MP4 segments. Jellyfin otherwise defaults to MPEG-TS,
+    // which cannot be appended to a SourceBuffer; asking explicitly makes the
+    // manifest carry an EXT-X-MAP init segment and `.mp4` fragments.
+    if (!/[?&]SegmentContainer=/i.test(path)) {
+      path += `&SegmentContainer=mp4`;
+    }
+    const url = `${session.serverUrl}${path}`;
     return {
       url,
       isDirect: false,

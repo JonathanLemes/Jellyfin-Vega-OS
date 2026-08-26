@@ -1,10 +1,11 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {ActivityIndicator, StyleSheet, Text, View} from 'react-native';
 import {useTVEventHandler, type HWEvent} from '@amazon-devices/react-native-kepler';
-import {Video} from '@amazon-devices/react-native-w3cmedia';
+import {KeplerVideoSurfaceView} from '@amazon-devices/react-native-w3cmedia';
 import {Gradient} from '../components/Gradient';
 import {Screen} from '../components/Screen';
-import {resolveStream, type ResolvedStream} from '../api/jellyfin';
+import {resolveStream} from '../api/jellyfin';
+import {HlsVideoPlayer} from '../player/hlsVideoPlayer';
 import {useApi, useApp} from '../state/AppContext';
 import {colors, radius, safeArea, spacing, typography} from '../theme/theme';
 import {episodeLabel, formatClock, secondsToTicks, ticksToSeconds} from '../utils/format';
@@ -24,37 +25,15 @@ const SEEK_LARGE = 30;
 const OSD_TIMEOUT_MS = 4000;
 /** Jellyfin expects a progress ping roughly every ten seconds. */
 const PROGRESS_INTERVAL_MS = 10000;
-
-interface StreamState extends ResolvedStream {
-  /** Absolute position, in seconds, that this stream begins at. */
-  startSeconds: number;
-}
-
-/**
- * Turns a `MediaError` into something a viewer can act on.
- *
- * Code 4 (`MEDIA_ERR_SRC_NOT_SUPPORTED`) is the one seen in practice on Vega
- * OS 1.2: the media backend rejects the URL outright with
- * `set_src_uri: MPB Call failed` before any decoding is attempted. See the
- * playback limitation in the README.
- */
-function describeMediaError(error?: {code?: number}): string {
-  switch (error?.code) {
-    case 1:
-      return 'Playback was stopped.';
-    case 2:
-      return 'The connection to the server was lost during playback.';
-    case 3:
-      return 'This file could not be decoded by the device.';
-    case 4:
-      return 'This device refused the stream. Vega OS 1.2 does not play media from a URL; see the playback limitation in the README.';
-    default:
-      return 'The device could not play this stream.';
-  }
-}
+/** How often the OSD re-reads the playhead. */
+const TICK_INTERVAL_MS = 500;
 
 /**
  * Full-screen video playback with a Jellyfin-style on-screen display.
+ *
+ * Playback goes through `HlsVideoPlayer`, which feeds fragmented-MP4 segments
+ * into Media Source Extensions: Vega OS will not open a media URL directly.
+ * The video is rendered into a `KeplerVideoSurfaceView` handed to the player.
  *
  * The OSD deliberately contains no focusable controls. Everything is driven
  * from remote key events, which avoids fighting the platform's spatial
@@ -64,33 +43,27 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   const api = useApi();
   const {deviceProfile} = useApp();
 
-  const videoRef = useRef<Video | null>(null);
+  const playerRef = useRef<HlsVideoPlayer | undefined>(undefined);
   const [item, setItem] = useState<BaseItemDto | undefined>();
-  const [stream, setStream] = useState<StreamState | undefined>();
   const [error, setError] = useState<string | undefined>();
-
   const [paused, setPaused] = useState(false);
   const [buffering, setBuffering] = useState(true);
-  /** Position within the current stream, before adding `startSeconds`. */
-  const [streamTime, setStreamTime] = useState(0);
+  const [position, setPosition] = useState(ticksToSeconds(startPositionTicks));
+  const [duration, setDuration] = useState(0);
   const [osdVisible, setOsdVisible] = useState(true);
-  /** Set once the native media player has finished initialising. */
-  const [playerReady, setPlayerReady] = useState(false);
 
   const osdTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  // Mirrors of state for use inside intervals and unmount cleanup, which would
+  // Mirrors for use inside intervals and unmount cleanup, which would
   // otherwise capture stale values.
-  const positionRef = useRef(0);
+  const positionRef = useRef(ticksToSeconds(startPositionTicks));
   const durationRef = useRef(0);
-  const streamRef = useRef<StreamState | undefined>(undefined);
+  const playMethodRef = useRef<string | undefined>(undefined);
+  const mediaSourceRef = useRef<string | undefined>(undefined);
+  const playSessionRef = useRef<string | undefined>(undefined);
   const startedRef = useRef(false);
 
-  const runtimeSeconds = ticksToSeconds(item?.RunTimeTicks);
-  const position = (stream?.startSeconds ?? 0) + streamTime;
-  const duration = runtimeSeconds || durationRef.current;
-
   positionRef.current = position;
-  streamRef.current = stream;
+  durationRef.current = duration;
 
   const showOsd = useCallback(() => {
     setOsdVisible(true);
@@ -100,43 +73,80 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     osdTimer.current = setTimeout(() => setOsdVisible(false), OSD_TIMEOUT_MS);
   }, []);
 
-  /**
-   * Asks the server how to play from `atSeconds` and swaps the stream in.
-   *
-   * Transcoded streams are re-requested at the new offset rather than sought
-   * within, because the server generates them starting at the requested point.
-   */
-  const openStream = useCallback(
-    async (atSeconds: number) => {
-      setBuffering(true);
-      setError(undefined);
-      try {
-        const detail = item ?? (await api.getItem(itemId));
-        if (!item) {
-          setItem(detail);
-        }
-        const info = await api.getPlaybackInfo(itemId, {
-          profile: deviceProfile,
-          startTimeTicks: secondsToTicks(atSeconds),
-          mediaSourceId,
-        });
-        const resolved = resolveStream(api.session, itemId, info, mediaSourceId);
-        // Direct play hands back the whole file, so its timeline starts at
-        // zero and the resume point is applied by seeking instead.
-        const startSeconds = resolved.isDirect ? 0 : atSeconds;
-        setStream({...resolved, startSeconds});
-        setStreamTime(resolved.isDirect ? atSeconds : 0);
-      } catch (err) {
-        setError((err as Error).message);
-        setBuffering(false);
-      }
-    },
-    [api, deviceProfile, item, itemId, mediaSourceId],
-  );
+  // --- Load and start -----------------------------------------------------
 
   useEffect(() => {
-    openStream(ticksToSeconds(startPositionTicks));
-    // Intentionally run once: re-opening is driven explicitly by seeks.
+    let cancelled = false;
+    const player = new HlsVideoPlayer({
+      onError: message => {
+        if (!cancelled) {
+          setError(message);
+          setBuffering(false);
+        }
+      },
+      onReady: total => {
+        if (cancelled) {
+          return;
+        }
+        setDuration(total);
+        setBuffering(false);
+        const resume = ticksToSeconds(startPositionTicks);
+        if (resume > 1) {
+          player.seek(resume);
+        }
+      },
+      onEnded: () => {
+        if (!cancelled) {
+          onExit();
+        }
+      },
+    });
+    playerRef.current = player;
+
+    (async () => {
+      try {
+        await player.initialize();
+        const detail = await api.getItem(itemId);
+        if (cancelled) {
+          return;
+        }
+        setItem(detail);
+        if (detail.RunTimeTicks) {
+          setDuration(ticksToSeconds(detail.RunTimeTicks));
+        }
+
+        const info = await api.getPlaybackInfo(itemId, {
+          profile: deviceProfile,
+          mediaSourceId,
+        });
+        if (cancelled) {
+          return;
+        }
+        const stream = resolveStream(api.session, itemId, info, mediaSourceId);
+        playMethodRef.current = stream.playMethod;
+        mediaSourceRef.current = stream.mediaSourceId;
+        playSessionRef.current = stream.playSessionId;
+
+        if (stream.isDirect) {
+          // Direct play cannot be fed to MSE; the API layer asks the server
+          // for a transcode, so this only happens if the server ignored that.
+          throw new Error('The server did not provide a stream this device can play.');
+        }
+        await player.load(stream.url, deviceProfile.MaxStreamingBitrate);
+      } catch (err) {
+        if (!cancelled) {
+          setError((err as Error).message);
+          setBuffering(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      void player.destroy();
+      playerRef.current = undefined;
+    };
+    // Deliberately mounts once; a change of item remounts the screen.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -149,41 +159,26 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     };
   }, [showOsd]);
 
-  /**
-   * Attaches the resolved stream once both it and the player are ready.
-   *
-   * Direct play returns the whole file, so the resume position is applied by
-   * seeking after the source is set; a transcode already starts at the right
-   * offset server-side.
-   */
+  // Polls the playhead: the element's timeupdate event is not delivered on
+  // this platform when rendering through a detached surface.
   useEffect(() => {
-    const video = videoRef.current;
-    if (!playerReady || !stream || !video) {
-      return;
-    }
-    video.src = stream.url;
-    if (stream.isDirect && streamTime > 0) {
-      video.currentTime = streamTime;
-    }
-    const started = video.play();
-    if (started && typeof (started as Promise<void>).catch === 'function') {
-      (started as unknown as Promise<void>).catch(() => {
-        setError('The device could not start this stream.');
-      });
-    }
-    // `streamTime` is read only for the initial seek; re-running on every tick
-    // would restart playback.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playerReady, stream]);
+    const timer = setInterval(() => {
+      const player = playerRef.current;
+      if (player && !paused) {
+        setPosition(player.currentTime);
+      }
+    }, TICK_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [paused]);
 
   // --- Playback reporting -------------------------------------------------
 
   const reportBody = useCallback(
     (extra: Record<string, unknown> = {}) => ({
       ItemId: itemId,
-      MediaSourceId: streamRef.current?.mediaSourceId,
-      PlaySessionId: streamRef.current?.playSessionId,
-      PlayMethod: streamRef.current?.playMethod,
+      MediaSourceId: mediaSourceRef.current,
+      PlaySessionId: playSessionRef.current,
+      PlayMethod: playMethodRef.current,
       PositionTicks: secondsToTicks(positionRef.current),
       CanSeek: true,
       IsPaused: false,
@@ -193,19 +188,18 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   );
 
   useEffect(() => {
-    if (!stream || startedRef.current) {
+    if (startedRef.current || !duration) {
       return;
     }
     startedRef.current = true;
     api.reportPlaybackStart(reportBody()).catch(() => undefined);
-  }, [api, reportBody, stream]);
+  }, [api, duration, reportBody]);
 
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!startedRef.current) {
-        return;
+      if (startedRef.current) {
+        api.reportPlaybackProgress(reportBody({IsPaused: paused})).catch(() => undefined);
       }
-      api.reportPlaybackProgress(reportBody({IsPaused: paused})).catch(() => undefined);
     }, PROGRESS_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [api, paused, reportBody]);
@@ -224,15 +218,15 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   // --- Controls -----------------------------------------------------------
 
   const togglePause = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) {
+    const player = playerRef.current;
+    if (!player) {
       return;
     }
     if (paused) {
-      video.play();
+      player.play();
       setPaused(false);
     } else {
-      video.pause();
+      player.pause();
       setPaused(true);
     }
     showOsd();
@@ -240,22 +234,18 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   const seekBy = useCallback(
     (delta: number) => {
-      const current = streamRef.current;
-      if (!current) {
+      const player = playerRef.current;
+      if (!player) {
         return;
       }
-      const limit = durationRef.current || runtimeSeconds;
+      const limit = durationRef.current;
       const target = Math.max(0, Math.min(limit ? limit - 1 : Infinity, positionRef.current + delta));
+      setPosition(target);
+      setBuffering(true);
+      player.seek(target);
       showOsd();
-
-      if (current.isDirect && videoRef.current) {
-        videoRef.current.currentTime = target;
-        setStreamTime(target);
-      } else {
-        openStream(target);
-      }
     },
-    [openStream, runtimeSeconds, showOsd],
+    [showOsd],
   );
 
   useTVEventHandler((event: HWEvent) => {
@@ -295,25 +285,6 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     }
   });
 
-  // --- Media element events ----------------------------------------------
-
-  const onTimeUpdate = useCallback(() => {
-    const video = videoRef.current;
-    if (video) {
-      setStreamTime(video.currentTime ?? 0);
-    }
-  }, []);
-
-  const onDurationChange = useCallback(() => {
-    const video = videoRef.current;
-    const value = video?.duration ?? 0;
-    // A transcoded stream reports only its own remaining length; the item's
-    // real runtime is the trustworthy total in that case.
-    if (isFinite(value) && value > 0 && !runtimeSeconds) {
-      durationRef.current = value;
-    }
-  }, [runtimeSeconds]);
-
   const title = useMemo(() => {
     if (!item) {
       return '';
@@ -346,29 +317,11 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   return (
     <Screen style={styles.black}>
-      <Video
-        controls={false}
-        onCanPlay={() => setBuffering(false)}
-        // The native player is not usable until this fires; assigning `src`
-        // before it does is silently rejected and surfaces only as an error
-        // event, so the source is attached from an effect keyed on this flag.
-        onComponentDidMount={() => setPlayerReady(true)}
-        onDurationChange={onDurationChange}
-        onEnded={onExit}
-        onError={() => setError(describeMediaError(videoRef.current?.error))}
-        onPause={() => setPaused(true)}
-        onPlay={() => setPaused(false)}
-        onPlaying={() => setBuffering(false)}
-        onTimeUpdate={onTimeUpdate}
-        onWaiting={() => setBuffering(true)}
-        ref={(ref: Video | null) => {
-          videoRef.current = ref;
-        }}
-        scalingmode="fit"
-        showCaptions
+      <KeplerVideoSurfaceView
+        onSurfaceViewCreated={(handle: string) => playerRef.current?.setSurface(handle)}
+        onSurfaceViewDestroyed={(handle: string) => playerRef.current?.clearSurface(handle)}
         style={StyleSheet.absoluteFill}
       />
-
 
       {buffering ? (
         <View style={styles.bufferOverlay} pointerEvents="none">
@@ -410,11 +363,6 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
               <Text style={styles.statusHint}>
                 ◀ ▶ seek {SEEK_SMALL}s · OK play/pause · Back to exit
               </Text>
-              {stream ? (
-                <Text style={styles.statusBadge}>
-                  {stream.isDirect ? 'Direct Play' : 'Transcoding'}
-                </Text>
-              ) : null}
             </View>
           </View>
         </View>
@@ -465,15 +413,6 @@ const styles = StyleSheet.create({
   statusRow: {alignItems: 'center', flexDirection: 'row', marginTop: spacing.sm},
   statusText: {color: colors.text, fontSize: 16, fontWeight: '600', minWidth: 130},
   statusHint: {color: colors.textTertiary, flex: 1, fontSize: 14},
-  statusBadge: {
-    backgroundColor: 'rgba(255, 255, 255, 0.14)',
-    borderRadius: radius.sm,
-    color: colors.textSecondary,
-    fontSize: 13,
-    overflow: 'hidden',
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 3,
-  },
   errorBox: {alignItems: 'center', flex: 1, justifyContent: 'center', padding: spacing.xxl},
   errorTitle: {...typography.title, marginBottom: spacing.sm},
   errorMessage: {...typography.bodySecondary, marginBottom: spacing.md, textAlign: 'center'},

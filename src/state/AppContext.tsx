@@ -2,7 +2,14 @@ import React, {createContext, useCallback, useContext, useEffect, useMemo, useSt
 import {JellyfinApi} from '../api/jellyfin';
 import {buildDeviceProfile, type DeviceProfile} from '../api/deviceProfile';
 import {buildMeasuredDeviceProfile} from '../api/vegaCapabilities';
-import {buildIdentity, clearSession, loadOrCreateDeviceId, loadSession, saveSession} from './storage';
+import {
+  buildIdentity,
+  clearCredentials,
+  clearSession,
+  loadOrCreateDeviceId,
+  loadSession,
+  saveSession,
+} from './storage';
 import type {DeviceIdentity, Session} from '../api/types';
 
 interface AppState {
@@ -61,7 +68,9 @@ export const AppProvider = ({children}: {children: React.ReactNode}) => {
   }, []);
 
   const signOut = useCallback(async () => {
-    await clearSession();
+    // Remembered credentials go too, otherwise the sign-in screen would
+    // immediately log the user back in.
+    await Promise.all([clearSession(), clearCredentials()]);
     setSession(undefined);
   }, []);
 

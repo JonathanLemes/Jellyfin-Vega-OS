@@ -1,91 +1,103 @@
-import {KeplerFileSystem as FileSystem} from '@amazon-devices/kepler-file-system';
+import {AsyncStorage} from '@amazon-devices/react-native-kepler';
 import type {DeviceIdentity, Session} from '../api/types';
 
 /**
- * Persistence for the signed-in session and the device identity.
+ * Persistence for the signed-in session, the device identity, and the
+ * remembered sign-in details.
  *
- * `/data` is the app's private, reboot-surviving directory in the Vega
- * sandbox. It is wiped on uninstall, which is why a reinstall asks the user to
- * sign in again.
- */
-const DATA_DIR = '/data';
-const SESSION_PATH = `${DATA_DIR}/session.json`;
-const DEVICE_PATH = `${DATA_DIR}/device.json`;
-const ENCODING = 'utf8';
-
-/**
- * `OpenMode.WRITE` from the Kepler file-system types.
+ * `AsyncStorage` from the Kepler runtime is used rather than
+ * `@amazon-devices/kepler-file-system`: on Vega OS 1.2 that module's
+ * `readFileAsString` and `writeStringToFile` fail with
+ * `com.amazon.kepler.io.IoError` for every path and open mode, so nothing
+ * written through it survives. Only `exists`, `getEntries` and `openFile`
+ * work there, which is not enough to store anything.
  *
- * The package's entry point re-exports only `KeplerFileSystem`, so the enum is
- * not importable without reaching into its internals; the value is stable.
+ * Storage is private to the app and cleared when it is uninstalled.
  */
-const OPEN_MODE_WRITE = 1;
+const SESSION_KEY = 'jellyfin.session';
+const DEVICE_KEY = 'jellyfin.deviceId';
+const CREDENTIALS_KEY = 'jellyfin.credentials';
 
-/**
- * Creates a file if it does not exist yet.
- *
- * `writeStringToFile` does not create its target, so writing to a path for the
- * first time fails. That is why the session has to be opened before it is
- * first written.
- */
-async function ensureFile(path: string): Promise<void> {
-  if (await FileSystem.exists(path)) {
-    return;
-  }
-  await FileSystem.openFile(path, OPEN_MODE_WRITE);
-}
-
-async function readJson<T>(path: string): Promise<T | undefined> {
+async function readJson<T>(key: string): Promise<T | undefined> {
   try {
-    if (!(await FileSystem.exists(path))) {
-      return undefined;
-    }
-    const raw = await FileSystem.readFileAsString(path, ENCODING);
+    const raw = await AsyncStorage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : undefined;
   } catch {
-    // A corrupt or unreadable file must not stop the app from starting; the
+    // A corrupt or unreadable value must not stop the app from starting; the
     // user simply lands back on the sign-in screen.
     return undefined;
   }
 }
 
-async function writeJson(path: string, value: unknown): Promise<void> {
-  await ensureFile(path);
-  await FileSystem.writeStringToFile(path, JSON.stringify(value), ENCODING);
+async function writeJson(key: string, value: unknown): Promise<void> {
+  await AsyncStorage.setItem(key, JSON.stringify(value));
+}
+
+async function remove(key: string): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(key);
+  } catch {
+    // Nothing actionable: the in-memory state is dropped regardless.
+  }
 }
 
 export function loadSession(): Promise<Session | undefined> {
-  return readJson<Session>(SESSION_PATH);
+  return readJson<Session>(SESSION_KEY);
 }
 
 export async function saveSession(session: Session): Promise<void> {
-  await writeJson(SESSION_PATH, session);
+  await writeJson(SESSION_KEY, session);
 }
 
-export async function clearSession(): Promise<void> {
+export function clearSession(): Promise<void> {
+  return remove(SESSION_KEY);
+}
+
+/**
+ * The last server and account used, so the sign-in screen can pre-fill and
+ * reconnect without retyping on a remote.
+ *
+ * The password is stored in clear text. It is private to this app and wiped on
+ * uninstall, but anyone with developer-mode access to the device can read it.
+ * It is kept because signing in with a D-pad is painful; signing out removes
+ * it.
+ */
+export interface RememberedCredentials {
+  serverUrl: string;
+  userName: string;
+  password?: string;
+}
+
+export function loadCredentials(): Promise<RememberedCredentials | undefined> {
+  return readJson<RememberedCredentials>(CREDENTIALS_KEY);
+}
+
+export async function saveCredentials(credentials: RememberedCredentials): Promise<void> {
   try {
-    if (await FileSystem.exists(SESSION_PATH)) {
-      await FileSystem.removeFile(SESSION_PATH);
-    }
+    await writeJson(CREDENTIALS_KEY, credentials);
   } catch {
-    // Nothing actionable: the in-memory session is dropped regardless.
+    // Convenience only: failing to remember must never block signing in.
   }
+}
+
+export function clearCredentials(): Promise<void> {
+  return remove(CREDENTIALS_KEY);
 }
 
 /**
  * Returns this installation's stable device id, creating one on first run.
  *
- * Jellyfin keys its device list on this value, so it must survive restarts;
- * a fresh id on every launch would fill the server's dashboard with entries.
+ * Jellyfin keys its device list on this value, so it must survive restarts; a
+ * fresh id on every launch would fill the server's dashboard with entries.
  */
 export async function loadOrCreateDeviceId(): Promise<string> {
-  const stored = await readJson<{deviceId?: string}>(DEVICE_PATH);
+  const stored = await readJson<{deviceId?: string}>(DEVICE_KEY);
   if (stored?.deviceId) {
     return stored.deviceId;
   }
   const deviceId = generateDeviceId();
   try {
-    await writeJson(DEVICE_PATH, {deviceId});
+    await writeJson(DEVICE_KEY, {deviceId});
   } catch {
     // If it cannot be persisted the app still works for this session.
   }
