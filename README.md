@@ -216,36 +216,28 @@ Two consequences follow:
   `SourceBuffer`. Asking explicitly is what makes the manifest carry an
   `EXT-X-MAP` initialisation segment and `.mp4` fragments.
 
-**Seeking happens inside the loaded playlist.** An HLS playlist always spans
-the whole item, and `StartTimeTicks` does *not* shift it — verified against
-Jellyfin 10.11, where the playlist comes back identical with and without it. So
-re-requesting the stream on a seek only ever restarts the video from the
-beginning. Instead the buffer is dropped, appending resumes from the segment
-covering the target, and the element is told to jump there.
+**Seeking follows the shape MSE is designed for**, rather than trying to drive
+the decoder by hand:
 
-Two details make that work. The `SourceBuffer` runs in **segments mode**, which
-places each fragment using the timestamps it carries: Jellyfin writes absolute
-decode times, so segment 500 of a six-second playlist really does report ~3000s
-and lands at its true position with no offset arithmetic. And the jump is
-re-asserted after each append until the playhead agrees, because `currentTime`
-is only honoured once data is actually buffered there — gating on `buffered`
-alone proved unreliable on this platform.
+1. assign `currentTime` — the element reports `seeking` and waits;
+2. point the fetch loop at the segment covering the target;
+3. let the element resume by itself once that data is appended.
 
-Seeking is **debounced**: pressing fast-forward moves the cursor immediately
-and accumulates against the pending target, but the stream only moves once the
-user stops pressing. Committing on every press tore the buffer down and rebuilt
-it repeatedly, which left the picture stuck. While the user is scrubbing, the
-playhead poll stands down so the cursor does not snap back to the real
-position between presses.
+The buffer is deliberately **not** torn down on a seek. A `SourceBuffer` copes
+with disjoint ranges perfectly well, and removing the range under the playhead
+is what previously left the pipeline stalled with nothing to play — the picture
+stayed frozen even after pausing and resuming. Data far behind the playhead is
+evicted lazily instead, only to stay within the device's buffer budget.
 
-The player reports back when a seek has actually landed. Without that signal
-the screen has no way to know the jump finished, and the loading indicator
-stays up forever — which is precisely what happened. There is also a bounded
-number of attempts, so a seek that never settles gives up and hands control
-back rather than spinning indefinitely.
+Buffering and position come from the element's own events (`seeking`, `seeked`,
+`waiting`, `playing`, `timeupdate`), not from polling. Polling `currentTime`
+cannot tell "waiting for data" apart from "paused", which is what made the
+loading indicator unreliable.
 
-Changing the audio track *is* a different stream, so that one is re-requested
-and resumed at the current position.
+An HLS playlist always spans the whole item, and `StartTimeTicks` does *not*
+shift it — verified against Jellyfin 10.11, where the playlist comes back
+identical with and without it. So a seek never re-requests the stream; doing so
+only ever restarted the video from the beginning.
 
 **Subtitles are rendered by the app.** Text tracks are fetched from Jellyfin as
 WebVTT, parsed, and drawn as an overlay. Doing it here rather than asking the

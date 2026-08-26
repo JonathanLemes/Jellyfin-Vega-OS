@@ -1,18 +1,31 @@
 import {AppendMode, type SourceBuffer} from '@amazon-devices/react-native-w3cmedia';
 
 /**
- * Serialises appends into a `SourceBuffer`.
+ * Serialises writes into a `SourceBuffer`.
  *
- * MSE rejects an `appendBuffer` while a previous one is still updating, so
- * every write has to queue behind `updateend`. This also owns the `remove()`
- * used when seeking, for the same reason.
+ * MSE rejects an `appendBuffer` or `remove` while a previous operation is still
+ * updating, so every write queues behind `updateend`. Evictions share that
+ * queue rather than jumping ahead of appends, which keeps the two from
+ * cancelling each other out.
  */
+
+interface Append {
+  kind: 'append';
+  data: ArrayBuffer;
+}
+
+interface Eviction {
+  kind: 'evict';
+  start: number;
+  end: number;
+}
+
+type Operation = Append | Eviction;
+
 export class AppendQueue {
-  private pending: ArrayBuffer[] = [];
+  private pending: Operation[] = [];
   private failed = false;
-  private removing = false;
-  /** Set when a clear arrived mid-update and still has to happen. */
-  private clearRequested = false;
+  private busy = false;
 
   constructor(
     private readonly sourceBuffer: SourceBuffer,
@@ -20,22 +33,16 @@ export class AppendQueue {
   ) {
     // Segments mode: each fragment is placed using the timestamps it carries.
     // Jellyfin writes absolute decode times -- segment 500 of a six-second
-    // playlist really does start at ~3000s -- so a fragment lands at its true
-    // position without any offset arithmetic, which is what makes seeking by
-    // segment index land where it should.
+    // playlist really does report ~3000s -- so fragments land at their true
+    // position with no offset arithmetic.
     try {
       this.sourceBuffer.mode = AppendMode.segments;
     } catch {
-      // Some builds fix the mode once the buffer has data; the default is
-      // already 'segments' for fragmented MP4.
+      // Some builds fix the mode once the buffer has data; 'segments' is
+      // already the default for fragmented MP4.
     }
     this.sourceBuffer.onupdateend = () => {
-      this.removing = false;
-      if (this.clearRequested) {
-        this.clearRequested = false;
-        this.clear();
-        return;
-      }
+      this.busy = false;
       this.flush();
     };
     this.sourceBuffer.onerror = () => {
@@ -49,41 +56,41 @@ export class AppendQueue {
     if (this.failed) {
       return;
     }
-    this.pending.push(data);
+    this.pending.push({kind: 'append', data});
     this.flush();
   }
 
-  /** Drops everything buffered; used before seeking to a new position. */
-  clear(): void {
-    this.pending = [];
-    if (this.failed) {
+  /**
+   * Drops writes that have not started yet.
+   *
+   * Used when seeking, to discard segments queued for the old position. What is
+   * already in the `SourceBuffer` is deliberately left alone: MSE handles
+   * disjoint ranges, and removing the range under the playhead strands the
+   * decoder with nothing to play.
+   */
+  dropQueued(): void {
+    this.pending = this.pending.filter(op => op.kind !== 'append');
+  }
+
+  /** Queues removal of a time range, used to bound memory use. */
+  evict(start: number, end: number): void {
+    if (this.failed || end <= start) {
       return;
     }
-    if (this.sourceBuffer.updating) {
-      // Deferred to `updateend`; dropping it here would leave the old range
-      // in place while new segments append somewhere else on the timeline.
-      this.clearRequested = true;
+    // One eviction in flight is enough; the range is cheap to recompute later.
+    if (this.pending.some(op => op.kind === 'evict')) {
       return;
     }
-    try {
-      this.removing = true;
-      this.sourceBuffer.remove(0, Number.POSITIVE_INFINITY);
-    } catch {
-      this.removing = false;
-    }
+    this.pending.push({kind: 'evict', start, end});
+    this.flush();
   }
 
   get idle(): boolean {
-    return (
-      !this.pending.length &&
-      !this.sourceBuffer.updating &&
-      !this.removing &&
-      !this.clearRequested
-    );
+    return !this.pending.length && !this.busy && !this.sourceBuffer.updating;
   }
 
   private flush(): void {
-    if (this.failed || this.removing || this.sourceBuffer.updating || !this.pending.length) {
+    if (this.failed || this.busy || this.sourceBuffer.updating || !this.pending.length) {
       return;
     }
     const next = this.pending.shift();
@@ -91,11 +98,24 @@ export class AppendQueue {
       return;
     }
     try {
-      this.sourceBuffer.appendBuffer(next);
+      this.busy = true;
+      if (next.kind === 'append') {
+        this.sourceBuffer.appendBuffer(next.data);
+      } else {
+        this.sourceBuffer.remove(next.start, next.end);
+      }
     } catch (error) {
+      this.busy = false;
+      const message = String((error as Error)?.message ?? '');
+      if (next.kind === 'append' && /quota/i.test(message)) {
+        // The buffer is full. Dropping this append is safe: the fetch loop
+        // sees the gap and asks for the segment again once eviction frees room.
+        this.onError('The device ran out of buffer space; freeing older data.');
+        return;
+      }
       this.failed = true;
       this.pending = [];
-      this.onError(`The device could not buffer this stream: ${(error as Error)?.message}`);
+      this.onError(`The device could not buffer this stream: ${message}`);
     }
   }
 }

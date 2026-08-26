@@ -13,32 +13,37 @@ import {
 /**
  * Plays a Jellyfin fragmented-MP4 HLS stream through Media Source Extensions.
  *
- * Vega OS 1.2 will not open a media URL directly — `set_src_uri` is rejected
- * before any decoding is attempted — so the manifest is parsed here, segments
+ * Vega OS 1.2 will not open a media URL directly -- `set_src_uri` is rejected
+ * before any decoding is attempted -- so the manifest is parsed here, segments
  * are fetched in JavaScript, and the bytes are pushed into a `SourceBuffer`.
- * This is the only playback path the platform accepts.
  *
- * Only the video pipeline is used: Jellyfin muxes audio into the same
- * fragmented-MP4 segments, so a single `SourceBuffer` carries both. (Splitting
- * them across two `MediaSource`s is what the Moonlight port needed, because
- * there the two elementary streams arrived separately.)
+ * Seeking follows the shape MSE is designed for rather than trying to drive the
+ * decoder by hand:
+ *
+ *   1. assign `currentTime`, which makes the element report `seeking` and wait;
+ *   2. point the fetch loop at the segment covering the target;
+ *   3. let the element resume by itself once data covering that position lands.
+ *
+ * In particular the buffer is *not* torn down on a seek. `SourceBuffer` copes
+ * with disjoint ranges perfectly well, and removing the range under the
+ * playhead is what previously left the pipeline stalled with no way back. Old
+ * data is evicted lazily instead, only to stay within the memory budget.
  */
 
 /** How many seconds to keep buffered ahead of the playhead. */
 const BUFFER_AHEAD_SECONDS = 30;
+/** Data further behind the playhead than this is dropped to bound memory. */
+const BUFFER_BEHIND_SECONDS = 60;
 /** How often to consider fetching the next segment. */
-const PUMP_INTERVAL_MS = 500;
-/** How close the playhead must land for a seek to count as done. */
-const SEEK_TOLERANCE_SECONDS = 2;
-/** Bounded so a stubborn element cannot leave the player retrying forever. */
-const MAX_SEEK_ATTEMPTS = 40;
+const PUMP_INTERVAL_MS = 250;
 
 export interface HlsPlayerCallbacks {
   onError(message: string): void;
   onReady(durationSeconds: number): void;
-  /** Fired once a requested seek has actually moved the playhead. */
-  onSeeked(positionSeconds: number): void;
-  /** Fired when every segment has been appended. */
+  /** Playback position, straight from the element's own `timeupdate`. */
+  onTime(positionSeconds: number): void;
+  /** True while the element is waiting for data. */
+  onBuffering(buffering: boolean): void;
   onEnded(): void;
 }
 
@@ -54,28 +59,47 @@ export class HlsVideoPlayer {
   private destroyed = false;
   private surfaceHandle?: string;
   private started = false;
-  /** Position the element should jump to once data is buffered there. */
-  private pendingSeek?: number;
-  private seekAttempts = 0;
-  /** True once `currentTime` has been assigned for the pending seek. */
-  private seekApplied = false;
+  /** Generation counter; a seek invalidates fetches already in flight. */
+  private epoch = 0;
 
   constructor(private readonly callbacks: HlsPlayerCallbacks) {}
 
-  get element(): VideoPlayer {
-    return this.player;
-  }
-
   async initialize(): Promise<void> {
     await this.player.initialize();
+    this.attachMediaEvents();
   }
 
   /**
-   * Attaches the render surface.
+   * Subscribes to the element's own events.
    *
-   * The surface arrives from `KeplerVideoSurfaceView` after layout, which may
-   * be before or after the stream is loaded, so both orderings are handled.
+   * These are the authoritative signals for buffering and position. Polling
+   * `currentTime` cannot tell "waiting for data" apart from "paused", which is
+   * what made the loading indicator unreliable.
    */
+  private attachMediaEvents(): void {
+    const on = (type: string, handler: () => void) => {
+      try {
+        this.player.addEventListener(type, handler as never);
+      } catch {
+        // A build without this event simply loses that signal.
+      }
+    };
+
+    on('timeupdate', () => this.callbacks.onTime(this.player.currentTime ?? 0));
+    on('seeking', () => this.callbacks.onBuffering(true));
+    on('waiting', () => this.callbacks.onBuffering(true));
+    on('stalled', () => this.callbacks.onBuffering(true));
+    on('seeked', () => {
+      this.callbacks.onTime(this.player.currentTime ?? 0);
+      // A seek that happened while starved leaves the element stopped, so make
+      // sure it is actually running again.
+      void this.player.play();
+    });
+    on('playing', () => this.callbacks.onBuffering(false));
+    on('canplay', () => this.callbacks.onBuffering(false));
+    on('ended', () => this.callbacks.onEnded());
+  }
+
   setSurface(handle: string): void {
     this.surfaceHandle = handle;
     if (!this.destroyed) {
@@ -93,23 +117,16 @@ export class HlsVideoPlayer {
     }
   }
 
-  /**
-   * Loads a master playlist and begins buffering.
-   *
-   * `maxBandwidth` caps variant selection so the client honours the same
-   * ceiling it advertised to the server.
-   */
   async load(masterUrl: string, maxBandwidth: number, startAtSeconds = 0): Promise<void> {
-    // Every load gets a fresh MediaSource. Reusing one after a seek leaves the
-    // old buffered timeline in place, and the element then waits forever for
-    // data at a position the new stream never produces.
+    // A fresh MediaSource per load: reusing one leaves the previous timeline in
+    // place and the element waits for data the new stream never produces.
     this.stopPump();
     this.started = false;
     this.queue = undefined;
     this.mediaSource = new MediaSource();
+    this.epoch += 1;
 
-    const masterText = await this.fetchText(masterUrl);
-    const variants = parseMasterPlaylist(masterText);
+    const variants = parseMasterPlaylist(await this.fetchText(masterUrl));
     const variant = selectVariant(variants, maxBandwidth);
     if (!variant) {
       throw new Error('The server did not offer a playable stream variant.');
@@ -123,12 +140,11 @@ export class HlsVideoPlayer {
     }
     this.playlist = playlist;
     this.nextSegment = this.segmentIndexFor(playlist, startAtSeconds);
-    this.pendingSeek = startAtSeconds > 0 ? startAtSeconds : undefined;
 
-    await this.attachMediaSource();
+    await this.attachMediaSource(startAtSeconds);
   }
 
-  private attachMediaSource(): Promise<void> {
+  private attachMediaSource(startAtSeconds: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const playlist = this.playlist;
       const variant = this.variant;
@@ -139,12 +155,20 @@ export class HlsVideoPlayer {
 
       this.mediaSource.onsourceopen = () => {
         try {
-          const mime = mimeTypeFor(variant);
-          const sourceBuffer = this.mediaSource.addSourceBuffer(mime);
+          const sourceBuffer = this.mediaSource.addSourceBuffer(mimeTypeFor(variant));
           this.queue = new AppendQueue(sourceBuffer, this.callbacks.onError);
           this.mediaSource.duration = playlist.totalDurationSeconds;
 
           void this.appendInit().then(() => {
+            if (startAtSeconds > 0) {
+              // Assigned before any media data: the element records the target
+              // and waits, then starts there once the segment arrives.
+              try {
+                this.player.currentTime = startAtSeconds;
+              } catch {
+                // Non-fatal; playback simply begins at zero.
+              }
+            }
             this.callbacks.onReady(playlist.totalDurationSeconds);
             this.startPump();
             this.maybeStart();
@@ -161,7 +185,6 @@ export class HlsVideoPlayer {
         }
       };
 
-      // Attaching the MediaSource is what triggers `sourceopen`.
       this.player.src = URL.createObjectURL(this.mediaSource as never);
     });
   }
@@ -169,20 +192,56 @@ export class HlsVideoPlayer {
   private async appendInit(): Promise<void> {
     const playlist = this.playlist;
     if (!playlist?.initUri) {
-      // Without an init segment the fragments have no moov and cannot decode.
       throw new Error('The stream is missing its initialisation segment.');
     }
-    const bytes = await this.fetchBinary(resolveUri(this.playlistUrl, playlist.initUri));
-    this.queue?.push(bytes);
+    this.queue?.push(await this.fetchBinary(resolveUri(this.playlistUrl, playlist.initUri)));
   }
 
-  /** Starts playback once both a surface and buffered data exist. */
   private maybeStart(): void {
     if (this.started || this.destroyed || !this.surfaceHandle || !this.queue) {
       return;
     }
     this.started = true;
     void this.player.play();
+  }
+
+  private segmentIndexFor(playlist: MediaPlaylist, seconds: number): number {
+    if (seconds <= 0) {
+      return 0;
+    }
+    const index = playlist.segments.findIndex(
+      s => seconds >= s.startSeconds && seconds < s.startSeconds + s.durationSeconds,
+    );
+    return index >= 0 ? index : Math.max(0, playlist.segments.length - 1);
+  }
+
+  /**
+   * Moves playback to `targetSeconds`.
+   *
+   * Nothing is removed and nothing is waited for: the element is told where to
+   * go, the fetch loop is aimed at the matching segment, and the element
+   * resumes on its own once that data has been appended.
+   */
+  seek(targetSeconds: number): void {
+    const playlist = this.playlist;
+    if (!playlist) {
+      return;
+    }
+    const target = Math.max(0, Math.min(playlist.totalDurationSeconds - 1, targetSeconds));
+
+    // Fetches already in flight belong to the old position; discard them
+    // rather than appending them ahead of the new one.
+    this.epoch += 1;
+    this.nextSegment = this.segmentIndexFor(playlist, target);
+    this.queue?.dropQueued();
+
+    try {
+      this.player.currentTime = target;
+    } catch {
+      // The element rejects a seek before it has metadata; the pump appends on
+      // the next tick and the assignment can be retried then.
+    }
+    this.startPump();
   }
 
   private startPump(): void {
@@ -198,16 +257,26 @@ export class HlsVideoPlayer {
     }
   }
 
-  /** Fetches the next segment when the buffer has drained below the target. */
+  /** Seconds of contiguous data ahead of `position`, or 0 if it is in a gap. */
+  private bufferedAhead(position: number): number {
+    try {
+      const buffered = this.player.buffered;
+      for (let i = 0; i < (buffered?.length ?? 0); i += 1) {
+        // A small tolerance: a fragment rarely starts exactly on the second
+        // that was asked for.
+        if (position >= buffered.start(i) - 1 && position < buffered.end(i)) {
+          return buffered.end(i) - position;
+        }
+      }
+    } catch {
+      // Unknown; treated as a gap so the caller fetches.
+    }
+    return 0;
+  }
+
   private async fill(): Promise<void> {
     const playlist = this.playlist;
-    if (this.destroyed || !playlist || !this.queue) {
-      return;
-    }
-    // Runs every tick, not only after a fetch, so a seek can settle once the
-    // decoder catches up without needing more data.
-    this.applyPendingSeek();
-    if (!this.queue.idle) {
+    if (this.destroyed || !playlist || !this.queue || !this.queue.idle) {
       return;
     }
     if (this.nextSegment >= playlist.segments.length) {
@@ -217,146 +286,48 @@ export class HlsVideoPlayer {
       } catch {
         // Already ended.
       }
-      this.callbacks.onEnded();
       return;
     }
 
-    // While a seek is outstanding, fetch unconditionally. The buffered range
-    // still reflects the *old* position until the removal completes, so the
-    // usual "enough buffered" test would decide no fetch is needed, never
-    // append, and therefore never let the seek settle -- a deadlock that
-    // shows as a spinner that never goes away.
-    if (this.pendingSeek === undefined) {
-      const bufferedEnd = this.bufferedEnd();
-      const position = this.player.currentTime ?? 0;
-      if (bufferedEnd - position > BUFFER_AHEAD_SECONDS) {
-        return;
-      }
+    const position = this.player.currentTime ?? 0;
+    // A gap under the playhead reports zero, so a seek always fetches at once.
+    if (this.bufferedAhead(position) > BUFFER_AHEAD_SECONDS) {
+      return;
     }
 
+    const epoch = this.epoch;
     const segment = playlist.segments[this.nextSegment];
     this.nextSegment += 1;
     try {
-      this.queue.push(await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri)));
-      this.applyPendingSeek();
+      const bytes = await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri));
+      if (this.destroyed || epoch !== this.epoch) {
+        return; // A seek happened while this was in flight.
+      }
+      this.queue.push(bytes);
+      this.evictBehind(position);
     } catch (error) {
-      // Rewind so the segment is retried on the next tick rather than leaving
-      // a hole in the timeline.
-      this.nextSegment -= 1;
+      if (epoch === this.epoch) {
+        // Retry this segment rather than leaving a hole in the timeline.
+        this.nextSegment -= 1;
+      }
       if (!this.destroyed) {
         this.callbacks.onError(`Could not load the stream: ${(error as Error)?.message}`);
       }
     }
   }
 
-  private bufferedCovers(seconds: number): boolean {
-    try {
-      const buffered = this.player.buffered;
-      for (let i = 0; i < (buffered?.length ?? 0); i += 1) {
-        // A small tolerance: the fragment boundary rarely lands exactly on the
-        // requested second.
-        if (seconds >= buffered.start(i) - 1 && seconds < buffered.end(i)) {
-          return true;
-        }
-      }
-    } catch {
-      // Unknown; treated as not buffered so the caller waits for more data.
-    }
-    return false;
-  }
-
-  private bufferedEnd(): number {
-    try {
-      const buffered = this.player.buffered;
-      return buffered && buffered.length ? buffered.end(buffered.length - 1) : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  private segmentIndexFor(playlist: MediaPlaylist, seconds: number): number {
-    if (seconds <= 0) {
-      return 0;
-    }
-    const index = playlist.segments.findIndex(
-      s => seconds >= s.startSeconds && seconds < s.startSeconds + s.durationSeconds,
-    );
-    return index >= 0 ? index : Math.max(0, playlist.segments.length - 1);
-  }
-
   /**
-   * Moves playback to `targetSeconds` within the loaded playlist.
+   * Drops data well behind the playhead.
    *
-   * The HLS playlist always covers the whole item -- `StartTimeTicks` does not
-   * shift it -- so seeking means dropping the buffer and resuming from the
-   * segment that covers the target, then telling the element to jump there
-   * once that data has actually landed.
+   * A two-hour film would otherwise buffer far past what the device can hold,
+   * and `appendBuffer` starts failing with a quota error.
    */
-  seek(targetSeconds: number): void {
-    const playlist = this.playlist;
-    if (!playlist || !this.queue) {
-      return;
-    }
-    const target = Math.max(0, Math.min(playlist.totalDurationSeconds - 1, targetSeconds));
-    const index = this.segmentIndexFor(playlist, target);
-
-    this.queue.clear();
-    this.nextSegment = index;
-    this.pendingSeek = target;
-    this.seekAttempts = 0;
-    this.seekApplied = false;
-    this.startPump();
-  }
-
-  /**
-   * Applies a queued seek once the buffer actually covers the target.
-   *
-   * Setting `currentTime` before the data is there is either ignored or leaves
-   * the element stalled waiting for a range that does not exist yet.
-   */
-  private applyPendingSeek(): void {
-    const target = this.pendingSeek;
-    if (target === undefined) {
-      return;
-    }
-
-    const current = this.player.currentTime ?? 0;
-    if (this.seekApplied && Math.abs(current - target) < SEEK_TOLERANCE_SECONDS) {
-      this.finishSeek(current);
-      return;
-    }
-    if (this.seekAttempts >= MAX_SEEK_ATTEMPTS) {
-      // Stop rather than fighting the element forever. Playback carries on
-      // from wherever it actually is, and -- importantly -- the screen is told,
-      // so it stops showing a spinner.
-      this.finishSeek(current);
-      return;
-    }
-    this.seekAttempts += 1;
-
-    if (!this.bufferedCovers(target)) {
-      // The data is not there yet; asking again now would only reset the
-      // pipeline. The pump keeps fetching because a pending seek bypasses the
-      // "enough buffered" test.
-      return;
-    }
-    try {
-      this.player.currentTime = target;
-      this.seekApplied = true;
-      void this.player.play();
-    } catch {
-      // Retried on the next tick.
+  private evictBehind(position: number): void {
+    const cutoff = position - BUFFER_BEHIND_SECONDS;
+    if (cutoff > 0) {
+      this.queue?.evict(0, cutoff);
     }
   }
-
-  private finishSeek(position: number): void {
-    this.pendingSeek = undefined;
-    this.seekAttempts = 0;
-    this.seekApplied = false;
-    void this.player.play();
-    this.callbacks.onSeeked(position);
-  }
-
 
   play(): void {
     void this.player.play();

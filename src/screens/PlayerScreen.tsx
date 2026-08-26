@@ -27,8 +27,6 @@ const SEEK_LARGE = 30;
 const OSD_TIMEOUT_MS = 4000;
 /** Jellyfin expects a progress ping roughly every ten seconds. */
 const PROGRESS_INTERVAL_MS = 10000;
-/** How often the OSD re-reads the playhead. */
-const TICK_INTERVAL_MS = 250;
 /** Quiet period after the last seek press before the stream actually moves. */
 const SCRUB_COMMIT_MS = 700;
 
@@ -164,10 +162,19 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
           setBuffering(false);
         }
       },
-      onSeeked: landed => {
-        scrubTargetRef.current = undefined;
-        setPosition(landed);
-        setBuffering(false);
+      onTime: seconds => {
+        // While the user is scrubbing, the OSD shows where they are heading;
+        // the element's own position would drag the cursor back.
+        if (scrubTargetRef.current === undefined) {
+          setPosition(seconds);
+        }
+      },
+      onBuffering: value => {
+        setBuffering(value);
+        if (!value) {
+          // The element has data and is running, so the scrub is finished.
+          scrubTargetRef.current = undefined;
+        }
       },
       onReady: total => {
         setBuffering(false);
@@ -221,20 +228,6 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       }
     };
   }, [showOsd]);
-
-  // Polls the playhead: `timeupdate` is not delivered when rendering through a
-  // detached surface on this platform.
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const player = playerRef.current;
-      // While scrubbing, the OSD shows where the user is heading; overwriting
-      // it with the real playhead is what made the cursor jump back.
-      if (player && !paused && scrubTargetRef.current === undefined) {
-        setPosition(player.currentTime);
-      }
-    }, TICK_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [paused]);
 
   // --- Tracks and subtitles ------------------------------------------------
 
@@ -367,7 +360,8 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       }
       scrubTimer.current = setTimeout(() => {
         scrubTimer.current = undefined;
-        setBuffering(true);
+        // No buffering flag is set here: the element reports `seeking` and
+        // then `playing` on its own, which is the only reliable signal.
         player.seek(target);
       }, SCRUB_COMMIT_MS);
     },
