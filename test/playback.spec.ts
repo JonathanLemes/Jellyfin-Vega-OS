@@ -22,7 +22,34 @@ describe('resolveStream', () => {
     const result = resolveStream(session, '1', info);
     expect(result.isDirect).toBe(false);
     expect(result.playMethod).toBe('Transcode');
-    expect(result.url).toBe('http://jf:8096/videos/1/master.m3u8?x=1');
+    expect(result.url).toBe('http://jf:8096/videos/1/master.m3u8?x=1&api_key=token');
+  });
+
+  it('appends the token to the transcoding URL', () => {
+    // The platform player cannot send an Authorization header, so a manifest
+    // URL without api_key comes back 401 and playback fails.
+    const info: PlaybackInfoResponse = {
+      MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8?VideoCodec=h264'}],
+    };
+    expect(resolveStream(session, '1', info).url).toContain('api_key=token');
+  });
+
+  it('does not duplicate a token the server already included', () => {
+    const info: PlaybackInfoResponse = {
+      MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8?api_key=abc'}],
+    };
+    const url = resolveStream(session, '1', info).url;
+    expect(url.match(/api_key=/g)).toHaveLength(1);
+    expect(url).toContain('api_key=abc');
+  });
+
+  it('adds the token with a leading ? when the URL has no query', () => {
+    const info: PlaybackInfoResponse = {
+      MediaSources: [{Id: 'ms1', TranscodingUrl: '/videos/1/master.m3u8'}],
+    };
+    expect(resolveStream(session, '1', info).url).toBe(
+      'http://jf:8096/videos/1/master.m3u8?api_key=token',
+    );
   });
 
   it('builds an authenticated direct-play URL otherwise', () => {

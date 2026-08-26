@@ -1,9 +1,9 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {ScrollView, StyleSheet, Text, TextInput, View} from 'react-native';
+import {ScrollView, StyleSheet, Text, View} from 'react-native';
 import {Button} from '../components/Button';
-import {Focusable} from '../components/Focusable';
 import {JellyfinLogo} from '../components/JellyfinLogo';
 import {Screen} from '../components/Screen';
+import {TextField} from '../components/TextField';
 import {
   authenticateByName,
   authenticateWithQuickConnect,
@@ -160,7 +160,8 @@ export const ConnectScreen = () => {
               Enter the address of your Jellyfin server, for example 192.168.1.10 or
               https://jellyfin.example.com
             </Text>
-            <LabelledInput
+            <TextField
+              style={styles.field}
               autoFocus
               label="Server address"
               onChangeText={setAddress}
@@ -195,14 +196,16 @@ export const ConnectScreen = () => {
               </View>
             ) : null}
 
-            <LabelledInput
+            <TextField
+              style={styles.field}
               autoFocus={!quickConnectCode}
               label="User name"
               onChangeText={setUsername}
               placeholder="User name"
               value={username}
             />
-            <LabelledInput
+            <TextField
+              style={styles.field}
               label="Password"
               onChangeText={setPassword}
               onSubmit={signInWithPassword}
@@ -246,57 +249,6 @@ export const ConnectScreen = () => {
   );
 };
 
-interface InputProps {
-  label: string;
-  value: string;
-  onChangeText: (value: string) => void;
-  onSubmit?: () => void;
-  placeholder?: string;
-  secure?: boolean;
-  autoFocus?: boolean;
-}
-
-/**
- * A text field wrapped in the app's focus treatment.
- *
- * The wrapper draws the focus ring, because a bare `TextInput` gives almost no
- * indication of remote focus before the keyboard opens.
- */
-const LabelledInput = ({
-  label,
-  value,
-  onChangeText,
-  onSubmit,
-  placeholder,
-  secure = false,
-  autoFocus = false,
-}: InputProps) => {
-  const inputRef = useRef<TextInput>(null);
-  return (
-    <View style={styles.field}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      <Focusable autoFocus={autoFocus} onPress={() => inputRef.current?.focus()}>
-        {focused => (
-          <View style={[styles.inputWrapper, focused && styles.inputWrapperFocused]}>
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              onChangeText={onChangeText}
-              onSubmitEditing={onSubmit}
-              placeholder={placeholder}
-              placeholderTextColor={colors.textTertiary}
-              ref={inputRef}
-              secureTextEntry={secure}
-              style={styles.input}
-              value={value}
-            />
-          </View>
-        )}
-      </Focusable>
-    </View>
-  );
-};
-
 const styles = StyleSheet.create({
   content: {alignItems: 'center', flexGrow: 1, justifyContent: 'center', padding: spacing.xxl},
   header: {marginBottom: spacing.xl},
@@ -311,26 +263,6 @@ const styles = StyleSheet.create({
   panelTitle: {...typography.title, marginBottom: spacing.xs},
   panelHint: {...typography.caption, marginBottom: spacing.lg},
   field: {marginBottom: spacing.md},
-  fieldLabel: {...typography.caption, marginBottom: spacing.xs},
-  inputWrapper: {
-    backgroundColor: colors.card,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    borderWidth: 2,
-  },
-  inputWrapperFocused: {
-    borderColor: colors.accent,
-    shadowColor: colors.accent,
-    shadowOffset: {width: 0, height: 0},
-    shadowOpacity: 0.7,
-    shadowRadius: 10,
-  },
-  input: {
-    color: colors.text,
-    fontSize: 18,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-  },
   error: {color: colors.danger, fontSize: 15, marginBottom: spacing.md},
   action: {marginTop: spacing.sm},
   actionRow: {flexDirection: 'row', marginTop: spacing.sm},

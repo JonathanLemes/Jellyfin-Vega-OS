@@ -55,6 +55,14 @@ export interface DeviceProfile {
   CodecProfiles: CodecProfile[];
 }
 
+/**
+ * Predicate used to ask the platform whether it can decode a MIME type.
+ *
+ * Kept abstract so the profile logic stays testable without a media stack;
+ * `vegaSupportProbe` supplies the real implementation.
+ */
+export type SupportProbe = (mime: string, kind: 'video' | 'audio') => Promise<boolean>;
+
 /** `canPlayType` returns "probably" | "maybe" | "" per the HTML spec. */
 export type CanPlayType = (mime: string) => string;
 
@@ -86,12 +94,51 @@ const AUDIO_CODEC_PROBES: Array<{codec: string; mimes: string[]}> = [
  * `canPlayType` needs an initialised player; before one exists this keeps the
  * app usable with the conservative set every Fire TV generation handles.
  */
-const FALLBACK_VIDEO_CODECS = ['h264', 'hevc'];
-const FALLBACK_AUDIO_CODECS = ['aac', 'mp3', 'ac3', 'eac3'];
+const FALLBACK_VIDEO_CODECS = ['h264'];
+// Deliberately excludes AC3/E-AC-3. A Fire TV Stick measured with
+// `decodingInfo` reports no Dolby support, and claiming it caused the server
+// to hand back a Dolby Digital Plus file for direct play that the device then
+// refused. When guessing, guess low: the cost is a needless transcode, not a
+// black screen.
+const FALLBACK_AUDIO_CODECS = ['aac', 'mp3'];
 
 export interface ProfileCapabilities {
   videoCodecs: string[];
   audioCodecs: string[];
+}
+
+/**
+ * Asks the platform about every codec family and keeps the ones it accepts.
+ *
+ * Probes run concurrently because each one crosses into the native media
+ * stack, and a serial sweep noticeably delays the first playback.
+ */
+export async function probeCapabilitiesAsync(probe: SupportProbe): Promise<ProfileCapabilities> {
+  const check = async (mimes: string[]) => {
+    const results = await Promise.all(
+      mimes.map(mime => probe(mime, 'video').catch(() => false)),
+    );
+    return results.some(Boolean);
+  };
+  const checkAudio = async (mimes: string[]) => {
+    const results = await Promise.all(
+      mimes.map(mime => probe(mime, 'audio').catch(() => false)),
+    );
+    return results.some(Boolean);
+  };
+
+  const [videoFlags, audioFlags] = await Promise.all([
+    Promise.all(VIDEO_CODEC_PROBES.map(p => check(p.mimes))),
+    Promise.all(AUDIO_CODEC_PROBES.map(p => checkAudio(p.mimes))),
+  ]);
+
+  const videoCodecs = VIDEO_CODEC_PROBES.filter((_, i) => videoFlags[i]).map(p => p.codec);
+  const audioCodecs = AUDIO_CODEC_PROBES.filter((_, i) => audioFlags[i]).map(p => p.codec);
+
+  return {
+    videoCodecs: videoCodecs.length ? videoCodecs : [...FALLBACK_VIDEO_CODECS],
+    audioCodecs: audioCodecs.length ? audioCodecs : [...FALLBACK_AUDIO_CODECS],
+  };
 }
 
 /** Probes the Vega media stack for the codecs it will accept. */
@@ -128,11 +175,13 @@ export interface ProfileOptions {
   /** Ceiling for transcoded streams, in bits per second. */
   maxStreamingBitrate?: number;
   canPlayType?: CanPlayType;
+  /** Pre-measured capabilities; skips probing when supplied. */
+  capabilities?: ProfileCapabilities;
 }
 
 export function buildDeviceProfile(options: ProfileOptions = {}): DeviceProfile {
-  const {maxStreamingBitrate = 20_000_000, canPlayType} = options;
-  const {videoCodecs, audioCodecs} = probeCapabilities(canPlayType);
+  const {maxStreamingBitrate = 20_000_000, canPlayType, capabilities} = options;
+  const {videoCodecs, audioCodecs} = capabilities ?? probeCapabilities(canPlayType);
 
   const directPlay: DirectPlayProfile[] = VIDEO_CONTAINERS.map(container => ({
     Container: container,

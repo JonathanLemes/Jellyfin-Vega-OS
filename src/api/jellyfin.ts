@@ -384,8 +384,17 @@ export function resolveStream(
   }
 
   if (source.TranscodingUrl) {
+    // The server omits the token from `TranscodingUrl`, but the platform
+    // player fetches the playlist itself and cannot attach an Authorization
+    // header, so an untouched URL answers 401 and playback fails with a bare
+    // decode error. Segments listed inside the manifest already carry the key.
+    const separator = source.TranscodingUrl.includes('?') ? '&' : '?';
+    const needsKey = !/[?&]api_key=/.test(source.TranscodingUrl);
+    const url =
+      `${session.serverUrl}${source.TranscodingUrl}` +
+      (needsKey ? `${separator}api_key=${encodeURIComponent(session.accessToken)}` : '');
     return {
-      url: `${session.serverUrl}${source.TranscodingUrl}`,
+      url,
       isDirect: false,
       mediaSourceId: source.Id,
       playSessionId: info.PlaySessionId,

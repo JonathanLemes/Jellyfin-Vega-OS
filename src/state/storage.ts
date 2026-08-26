@@ -13,6 +13,28 @@ const SESSION_PATH = `${DATA_DIR}/session.json`;
 const DEVICE_PATH = `${DATA_DIR}/device.json`;
 const ENCODING = 'utf8';
 
+/**
+ * `OpenMode.WRITE` from the Kepler file-system types.
+ *
+ * The package's entry point re-exports only `KeplerFileSystem`, so the enum is
+ * not importable without reaching into its internals; the value is stable.
+ */
+const OPEN_MODE_WRITE = 1;
+
+/**
+ * Creates a file if it does not exist yet.
+ *
+ * `writeStringToFile` does not create its target, so writing to a path for the
+ * first time fails. That is why the session has to be opened before it is
+ * first written.
+ */
+async function ensureFile(path: string): Promise<void> {
+  if (await FileSystem.exists(path)) {
+    return;
+  }
+  await FileSystem.openFile(path, OPEN_MODE_WRITE);
+}
+
 async function readJson<T>(path: string): Promise<T | undefined> {
   try {
     if (!(await FileSystem.exists(path))) {
@@ -28,6 +50,7 @@ async function readJson<T>(path: string): Promise<T | undefined> {
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
+  await ensureFile(path);
   await FileSystem.writeStringToFile(path, JSON.stringify(value), ENCODING);
 }
 

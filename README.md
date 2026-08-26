@@ -28,12 +28,12 @@ hardware decoders.
 - Detail pages with backdrop art, logo treatment, cast, and recommendations
 - Series browsing: season picker and an episode list with stills and progress
 - Search across movies, series, episodes, albums, artists and collections
-- Playback with direct play when the device can decode the file, and server-side
-  HLS transcoding when it cannot
-- A Jellyfin-styled on-screen display with seek, pause, and a Direct Play /
-  Transcoding indicator
 - Watch-state reporting, so progress syncs with every other Jellyfin client
 - Mark watched/unwatched and favourite from the detail page
+- Playback negotiation: direct play when the device can decode the file,
+  server-side HLS transcoding when it cannot, plus a Jellyfin-styled on-screen
+  display — **but see the playback limitation below; video does not yet render
+  on Vega OS 1.2**
 
 ## Requirements
 
@@ -146,12 +146,50 @@ in `/data`, the app's private sandbox directory. It survives reboots and
 upgrades, and is cleared on uninstall — so reinstalling asks you to sign in
 again.
 
-**The media services in `manifest.toml` are load-bearing.** Removing any of the
-`com.amazon.media*` / `com.amazon.audio.*` service entries does not produce a
-permission error; the player instead fails to create a decoder with a generic
-message. If playback breaks after a manifest change, check those first.
+**Service entries in `manifest.toml` are load-bearing, and failures are
+silent.** Vega does not report a missing service as a permission error — the
+feature just misbehaves. Two cases cost real debugging time here:
+`com.amazon.inputmethod.service` is what lets a focused `TextInput` open the
+on-screen keyboard (without it the field is simply dead, and the only clue is
+`no active connection to input method service` in the device log), and the
+`com.amazon.media*` / `com.amazon.audio.*` entries are what let the player
+create a decoder at all. If something stops working after a manifest change,
+check those first.
 
-## Limitations
+**The text field must be the focusable element itself.** Wrapping a
+`TextInput` in a focusable `Pressable` and calling `.focus()` on press does not
+open the keyboard: the wrapper holds platform focus, the input never does, and
+the IME never attaches. `TextField` therefore makes the input focusable and
+draws the focus ring from the input's own focus events.
+
+## Known limitation: video does not play yet
+
+Everything up to and including playback negotiation works on a real Fire TV —
+sign-in, browsing, artwork, the detail page, the `PlaybackInfo` exchange, and
+the direct-play/transcode decision. **The video itself does not render.**
+
+Assigning a URL to the media element is rejected by the platform before any
+decoding happens:
+
+```
+W3CMEDIA:[MSE_EME] set_src_uri: MPB Call failed with code: 50004
+W3CMEDIA:[MSE_EME] MediaPlayerPipelineImpl::prepareForPlayback(): set_src_uri(mUri) failed
+W3CMEDIA:makeMediaError: code= 4      # MEDIA_ERR_SRC_NOT_SUPPORTED
+```
+
+This happens for direct play and for HLS, for MP4 and for MKV, and the URLs
+themselves are fine (they return `200 video/mp4` to `curl`). The package README
+advertises URL playback, but on Vega OS 1.2 the media backend appears to accept
+only **Media Source Extensions** — a `MediaSource` fed by `SourceBuffer`
+appends, which is the path the Vega documentation's own example uses.
+
+Making playback work therefore needs the player rewritten around MSE: parse the
+HLS manifest in JavaScript, fetch fragmented-MP4 segments, and append them to a
+`SourceBuffer`, rather than handing a URL to the element. Jellyfin can emit
+fMP4 HLS segments (`SegmentContainer=mp4`), which are appendable as-is, so no
+remuxing is needed — but it is a substantial piece of work and is not done.
+
+## Other limitations
 
 - Subtitles rely on the platform's caption rendering; there is no in-app
   subtitle or audio-track picker yet, so the server's default tracks are used.

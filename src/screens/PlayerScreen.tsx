@@ -31,6 +31,29 @@ interface StreamState extends ResolvedStream {
 }
 
 /**
+ * Turns a `MediaError` into something a viewer can act on.
+ *
+ * Code 4 (`MEDIA_ERR_SRC_NOT_SUPPORTED`) is the one seen in practice on Vega
+ * OS 1.2: the media backend rejects the URL outright with
+ * `set_src_uri: MPB Call failed` before any decoding is attempted. See the
+ * playback limitation in the README.
+ */
+function describeMediaError(error?: {code?: number}): string {
+  switch (error?.code) {
+    case 1:
+      return 'Playback was stopped.';
+    case 2:
+      return 'The connection to the server was lost during playback.';
+    case 3:
+      return 'This file could not be decoded by the device.';
+    case 4:
+      return 'This device refused the stream. Vega OS 1.2 does not play media from a URL; see the playback limitation in the README.';
+    default:
+      return 'The device could not play this stream.';
+  }
+}
+
+/**
  * Full-screen video playback with a Jellyfin-style on-screen display.
  *
  * The OSD deliberately contains no focusable controls. Everything is driven
@@ -51,6 +74,8 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   /** Position within the current stream, before adding `startSeconds`. */
   const [streamTime, setStreamTime] = useState(0);
   const [osdVisible, setOsdVisible] = useState(true);
+  /** Set once the native media player has finished initialising. */
+  const [playerReady, setPlayerReady] = useState(false);
 
   const osdTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Mirrors of state for use inside intervals and unmount cleanup, which would
@@ -123,6 +148,33 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       }
     };
   }, [showOsd]);
+
+  /**
+   * Attaches the resolved stream once both it and the player are ready.
+   *
+   * Direct play returns the whole file, so the resume position is applied by
+   * seeking after the source is set; a transcode already starts at the right
+   * offset server-side.
+   */
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!playerReady || !stream || !video) {
+      return;
+    }
+    video.src = stream.url;
+    if (stream.isDirect && streamTime > 0) {
+      video.currentTime = streamTime;
+    }
+    const started = video.play();
+    if (started && typeof (started as Promise<void>).catch === 'function') {
+      (started as unknown as Promise<void>).catch(() => {
+        setError('The device could not start this stream.');
+      });
+    }
+    // `streamTime` is read only for the initial seek; re-running on every tick
+    // would restart playback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playerReady, stream]);
 
   // --- Playback reporting -------------------------------------------------
 
@@ -294,28 +346,29 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   return (
     <Screen style={styles.black}>
-      {stream ? (
-        <Video
-          autoplay
-          controls={false}
-          onCanPlay={() => setBuffering(false)}
-          onDurationChange={onDurationChange}
-          onEnded={onExit}
-          onError={() => setError('The device could not play this stream.')}
-          onPause={() => setPaused(true)}
-          onPlay={() => setPaused(false)}
-          onPlaying={() => setBuffering(false)}
-          onTimeUpdate={onTimeUpdate}
-          onWaiting={() => setBuffering(true)}
-          ref={(ref: Video | null) => {
-            videoRef.current = ref;
-          }}
-          scalingmode="fit"
-          showCaptions
-          src={stream.url}
-          style={StyleSheet.absoluteFill}
-        />
-      ) : null}
+      <Video
+        controls={false}
+        onCanPlay={() => setBuffering(false)}
+        // The native player is not usable until this fires; assigning `src`
+        // before it does is silently rejected and surfaces only as an error
+        // event, so the source is attached from an effect keyed on this flag.
+        onComponentDidMount={() => setPlayerReady(true)}
+        onDurationChange={onDurationChange}
+        onEnded={onExit}
+        onError={() => setError(describeMediaError(videoRef.current?.error))}
+        onPause={() => setPaused(true)}
+        onPlay={() => setPaused(false)}
+        onPlaying={() => setBuffering(false)}
+        onTimeUpdate={onTimeUpdate}
+        onWaiting={() => setBuffering(true)}
+        ref={(ref: Video | null) => {
+          videoRef.current = ref;
+        }}
+        scalingmode="fit"
+        showCaptions
+        style={StyleSheet.absoluteFill}
+      />
+
 
       {buffering ? (
         <View style={styles.bufferOverlay} pointerEvents="none">

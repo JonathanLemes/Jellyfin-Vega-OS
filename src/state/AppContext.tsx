@@ -1,6 +1,7 @@
 import React, {createContext, useCallback, useContext, useEffect, useMemo, useState} from 'react';
 import {JellyfinApi} from '../api/jellyfin';
 import {buildDeviceProfile, type DeviceProfile} from '../api/deviceProfile';
+import {buildMeasuredDeviceProfile} from '../api/vegaCapabilities';
 import {buildIdentity, clearSession, loadOrCreateDeviceId, loadSession, saveSession} from './storage';
 import type {DeviceIdentity, Session} from '../api/types';
 
@@ -33,11 +34,13 @@ export const AppProvider = ({children}: {children: React.ReactNode}) => {
       if (cancelled) {
         return;
       }
-      setIdentity(buildIdentity(deviceId, DEVICE_NAME));
+      const id = buildIdentity(deviceId, DEVICE_NAME);
+      setIdentity(id);
       // A stored session may carry a device id from an earlier install; the
       // current one wins so the server sees a single consistent device.
       setSession(restored ? {...restored, deviceId} : undefined);
       setInitializing(false);
+
     })();
     return () => {
       cancelled = true;
@@ -45,7 +48,15 @@ export const AppProvider = ({children}: {children: React.ReactNode}) => {
   }, []);
 
   const signIn = useCallback(async (next: Session) => {
-    await saveSession(next);
+    // The session is adopted whether or not it can be persisted. Letting a
+    // storage failure propagate would strand the user on the sign-in screen
+    // with a valid token already issued by the server; the worst case here is
+    // having to sign in again after a restart.
+    try {
+      await saveSession(next);
+    } catch (error) {
+      console.warn('Could not persist the session', error);
+    }
     setSession(next);
   }, []);
 
@@ -54,9 +65,23 @@ export const AppProvider = ({children}: {children: React.ReactNode}) => {
     setSession(undefined);
   }, []);
 
-  // Built once: probing the media stack on every render would be wasteful, and
-  // the device's capabilities cannot change while the app is running.
-  const deviceProfile = useMemo(() => buildDeviceProfile(), []);
+  // Measured once at start-up. Until the probe answers, the conservative
+  // built-in profile is used so playback is never blocked on it.
+  const [deviceProfile, setDeviceProfile] = useState<DeviceProfile>(() => buildDeviceProfile());
+
+  useEffect(() => {
+    let cancelled = false;
+    buildMeasuredDeviceProfile()
+      .then(({profile}) => {
+        if (!cancelled) {
+          setDeviceProfile(profile);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const api = useMemo(
     () => (session && identity ? new JellyfinApi(session, identity) : undefined),

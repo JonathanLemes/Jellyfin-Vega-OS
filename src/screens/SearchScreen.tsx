@@ -1,9 +1,9 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {FlatList, StyleSheet, Text, TextInput, View} from 'react-native';
-import {Focusable} from '../components/Focusable';
+import {FlatList, StyleSheet, Text, View} from 'react-native';
 import {MediaCard} from '../components/MediaCard';
 import {LIST_PERFORMANCE_PROPS} from '../components/listConfig';
 import {EmptyView, LoadingView, Screen} from '../components/Screen';
+import {TextField} from '../components/TextField';
 import {useApi, useApp} from '../state/AppContext';
 import {colors, radius, safeArea, spacing, typography} from '../theme/theme';
 import type {BaseItemDto} from '../api/types';
@@ -26,7 +26,6 @@ export const SearchScreen = ({onNavigate}: Props) => {
   const [results, setResults] = useState<BaseItemDto[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
-  const inputRef = useRef<TextInput>(null);
   const requestId = useRef(0);
 
   useEffect(() => {
@@ -75,22 +74,13 @@ export const SearchScreen = ({onNavigate}: Props) => {
     <Screen>
       <View style={styles.header}>
         <Text style={styles.title}>Search</Text>
-        <Focusable autoFocus onPress={() => inputRef.current?.focus()} style={styles.inputFocusable}>
-          {focused => (
-            <View style={[styles.inputWrapper, focused && styles.inputWrapperFocused]}>
-              <TextInput
-                autoCapitalize="none"
-                autoCorrect={false}
-                onChangeText={setTerm}
-                placeholder="Search movies, shows and episodes"
-                placeholderTextColor={colors.textTertiary}
-                ref={inputRef}
-                style={styles.input}
-                value={term}
-              />
-            </View>
-          )}
-        </Focusable>
+        <TextField
+          autoFocus
+          onChangeText={setTerm}
+          placeholder="Search movies, shows and episodes"
+          style={styles.searchField}
+          value={term}
+        />
       </View>
 
       {loading ? (
@@ -123,26 +113,6 @@ export const SearchScreen = ({onNavigate}: Props) => {
 const styles = StyleSheet.create({
   header: {paddingHorizontal: safeArea.horizontal, paddingTop: safeArea.vertical},
   title: {...typography.title, marginBottom: spacing.md},
-  inputFocusable: {marginBottom: spacing.lg},
-  inputWrapper: {
-    backgroundColor: colors.card,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    borderWidth: 2,
-    maxWidth: 900,
-  },
-  inputWrapperFocused: {
-    borderColor: colors.accent,
-    shadowColor: colors.accent,
-    shadowOffset: {width: 0, height: 0},
-    shadowOpacity: 0.7,
-    shadowRadius: 10,
-  },
-  input: {
-    color: colors.text,
-    fontSize: 18,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-  },
+  searchField: {marginBottom: spacing.lg, maxWidth: 900},
   grid: {paddingHorizontal: safeArea.horizontal - spacing.sm, paddingBottom: spacing.xxl},
 });
