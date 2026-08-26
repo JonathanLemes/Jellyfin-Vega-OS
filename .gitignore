@@ -1,0 +1,16 @@
+*.iml
+*.swp
+.idea
+.DS_Store
+.vscode
+.tmp
+
+dist
+build
+node_modules
+CMakeUserPresets.json
+npm-debug.log
+
+# Vega build outputs: absolute host paths and lint caches, not portable.
+buildinfo.json
+generated/
