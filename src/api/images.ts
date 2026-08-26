@@ -65,6 +65,77 @@ export function posterUrl(
 }
 
 /**
+ * Every wide-artwork candidate for an item, best first.
+ *
+ * A tag only says the server has metadata for an image, not that the file is
+ * still on disk; Jellyfin answers 404 when the artwork has gone missing. The
+ * card walks this list on load failure so a stale `Thumb` tag degrades to the
+ * episode still, the series backdrop, and finally the poster, instead of
+ * leaving a grey box.
+ */
+export function thumbCandidates(
+  serverUrl: string,
+  item: BaseItemDto,
+  maxWidth = 640,
+): string[] {
+  const candidates = [
+    item.ImageTags?.Thumb &&
+      imageUrl(serverUrl, item.Id, 'Thumb', {maxWidth, tag: item.ImageTags.Thumb}),
+    item.ImageTags?.Primary &&
+      imageUrl(serverUrl, item.Id, 'Primary', {maxWidth, tag: item.ImageTags.Primary}),
+    item.BackdropImageTags?.length &&
+      imageUrl(serverUrl, item.Id, 'Backdrop', {maxWidth, tag: item.BackdropImageTags[0]}),
+    item.ParentThumbItemId &&
+      item.ParentThumbImageTag &&
+      imageUrl(serverUrl, item.ParentThumbItemId, 'Thumb', {
+        maxWidth,
+        tag: item.ParentThumbImageTag,
+      }),
+    item.ParentBackdropItemId &&
+      item.ParentBackdropImageTags?.length &&
+      imageUrl(serverUrl, item.ParentBackdropItemId, 'Backdrop', {
+        maxWidth,
+        tag: item.ParentBackdropImageTags[0],
+      }),
+    // Last resort: the series poster. Wrong aspect ratio, but recognisable.
+    item.SeriesId &&
+      item.SeriesPrimaryImageTag &&
+      imageUrl(serverUrl, item.SeriesId, 'Primary', {
+        maxWidth,
+        tag: item.SeriesPrimaryImageTag,
+      }),
+  ];
+  return candidates.filter((c): c is string => typeof c === 'string');
+}
+
+/** Poster candidates for an item, best first. */
+export function posterCandidates(
+  serverUrl: string,
+  item: BaseItemDto,
+  maxHeight = 480,
+): string[] {
+  const candidates = [
+    item.ImageTags?.Primary &&
+      imageUrl(serverUrl, item.Id, 'Primary', {maxHeight, tag: item.ImageTags.Primary}),
+    item.SeriesId &&
+      item.SeriesPrimaryImageTag &&
+      imageUrl(serverUrl, item.SeriesId, 'Primary', {
+        maxHeight,
+        tag: item.SeriesPrimaryImageTag,
+      }),
+    item.AlbumId &&
+      item.AlbumPrimaryImageTag &&
+      imageUrl(serverUrl, item.AlbumId, 'Primary', {
+        maxHeight,
+        tag: item.AlbumPrimaryImageTag,
+      }),
+    item.ImageTags?.Thumb &&
+      imageUrl(serverUrl, item.Id, 'Thumb', {maxHeight, tag: item.ImageTags.Thumb}),
+  ];
+  return candidates.filter((c): c is string => typeof c === 'string');
+}
+
+/**
  * Wide artwork for an item, preferring a real thumb and falling back through
  * the item's own backdrop and then the parent's, which is what episodes need.
  */

@@ -4,12 +4,14 @@ import {useTVEventHandler, type HWEvent} from '@amazon-devices/react-native-kepl
 import {KeplerVideoSurfaceView} from '@amazon-devices/react-native-w3cmedia';
 import {Gradient} from '../components/Gradient';
 import {Screen} from '../components/Screen';
+import {PlayerMenu, type PlayerMenuState} from '../components/PlayerMenu';
 import {resolveStream} from '../api/jellyfin';
 import {HlsVideoPlayer} from '../player/hlsVideoPlayer';
+import {cueAt, parseVtt, type Cue} from '../player/subtitles';
 import {useApi, useApp} from '../state/AppContext';
 import {colors, radius, safeArea, spacing, typography} from '../theme/theme';
 import {episodeLabel, formatClock, secondsToTicks, ticksToSeconds} from '../utils/format';
-import type {BaseItemDto} from '../api/types';
+import type {BaseItemDto, MediaStream} from '../api/types';
 
 interface Props {
   itemId: string;
@@ -26,18 +28,20 @@ const OSD_TIMEOUT_MS = 4000;
 /** Jellyfin expects a progress ping roughly every ten seconds. */
 const PROGRESS_INTERVAL_MS = 10000;
 /** How often the OSD re-reads the playhead. */
-const TICK_INTERVAL_MS = 500;
+const TICK_INTERVAL_MS = 250;
 
 /**
  * Full-screen video playback with a Jellyfin-style on-screen display.
  *
  * Playback goes through `HlsVideoPlayer`, which feeds fragmented-MP4 segments
- * into Media Source Extensions: Vega OS will not open a media URL directly.
- * The video is rendered into a `KeplerVideoSurfaceView` handed to the player.
+ * into Media Source Extensions: Vega OS will not open a media URL.
  *
- * The OSD deliberately contains no focusable controls. Everything is driven
- * from remote key events, which avoids fighting the platform's spatial
- * navigation and matches how TV players are expected to behave.
+ * Seeking and track changes both re-request the stream from the server at a new
+ * offset rather than moving within the current one. Jellyfin transcodes a
+ * session sequentially, so jumping to a segment it has not produced yet simply
+ * hangs; asking for a new stream starting at the target is what the server is
+ * built to serve. `streamStart` records where the current stream begins so the
+ * OSD can still show an absolute position.
  */
 export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onExit}: Props) => {
   const api = useApi();
@@ -51,16 +55,28 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   const [position, setPosition] = useState(ticksToSeconds(startPositionTicks));
   const [duration, setDuration] = useState(0);
   const [osdVisible, setOsdVisible] = useState(true);
+  const [menu, setMenu] = useState<PlayerMenuState>('closed');
+
+  const [tracks, setTracks] = useState<MediaStream[]>([]);
+  const [audioIndex, setAudioIndex] = useState<number | undefined>();
+  const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>();
+  const [subtitleOffset, setSubtitleOffset] = useState(0);
+  const [cues, setCues] = useState<Cue[]>([]);
+  const [caption, setCaption] = useState('');
 
   const osdTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Mirrors for use inside intervals and unmount cleanup, which would
   // otherwise capture stale values.
   const positionRef = useRef(ticksToSeconds(startPositionTicks));
   const durationRef = useRef(0);
+  const streamStart = useRef(0);
   const playMethodRef = useRef<string | undefined>(undefined);
   const mediaSourceRef = useRef<string | undefined>(undefined);
   const playSessionRef = useRef<string | undefined>(undefined);
   const startedRef = useRef(false);
+  const cancelledRef = useRef(false);
+  // Rejects results from a stream request that a newer one has superseded.
+  const loadToken = useRef(0);
 
   positionRef.current = position;
   durationRef.current = duration;
@@ -73,30 +89,80 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     osdTimer.current = setTimeout(() => setOsdVisible(false), OSD_TIMEOUT_MS);
   }, []);
 
-  // --- Load and start -----------------------------------------------------
+  /**
+   * Asks the server for a stream starting at `atSeconds` and plays it.
+   *
+   * Used for the initial load, for every seek, and whenever the audio or
+   * burned-in subtitle selection changes.
+   */
+  const openStream = useCallback(
+    async (atSeconds: number, audio?: number, subtitle?: number) => {
+      const player = playerRef.current;
+      if (!player) {
+        return;
+      }
+      const token = ++loadToken.current;
+      setBuffering(true);
+      setError(undefined);
+      streamStart.current = atSeconds;
+      setPosition(atSeconds);
+
+      try {
+        const info = await api.getPlaybackInfo(itemId, {
+          profile: deviceProfile,
+          startTimeTicks: secondsToTicks(atSeconds),
+          mediaSourceId,
+          audioStreamIndex: audio,
+          subtitleStreamIndex: subtitle,
+        });
+        if (cancelledRef.current || token !== loadToken.current) {
+          return;
+        }
+        const stream = resolveStream(api.session, itemId, info, mediaSourceId);
+        playMethodRef.current = stream.playMethod;
+        mediaSourceRef.current = stream.mediaSourceId;
+        playSessionRef.current = stream.playSessionId;
+        setTracks(stream.mediaStreams);
+        // Adopt the server's defaults once, so the menu opens showing what is
+        // actually playing rather than "None".
+        setAudioIndex(current => current ?? stream.defaultAudioIndex);
+        setSubtitleIndex(current =>
+          current ?? (subtitle === undefined ? stream.defaultSubtitleIndex : subtitle),
+        );
+
+        if (stream.isDirect) {
+          throw new Error('The server did not provide a stream this device can play.');
+        }
+        await player.load(stream.url, deviceProfile.MaxStreamingBitrate);
+        if (cancelledRef.current || token !== loadToken.current) {
+          return;
+        }
+        setBuffering(false);
+        setPaused(false);
+      } catch (err) {
+        if (!cancelledRef.current && token === loadToken.current) {
+          setError((err as Error).message);
+          setBuffering(false);
+        }
+      }
+    },
+    [api, deviceProfile, itemId, mediaSourceId],
+  );
+
+  // --- Mount --------------------------------------------------------------
 
   useEffect(() => {
-    let cancelled = false;
+    cancelledRef.current = false;
     const player = new HlsVideoPlayer({
       onError: message => {
-        if (!cancelled) {
+        if (!cancelledRef.current) {
           setError(message);
           setBuffering(false);
         }
       },
-      onReady: total => {
-        if (cancelled) {
-          return;
-        }
-        setDuration(total);
-        setBuffering(false);
-        const resume = ticksToSeconds(startPositionTicks);
-        if (resume > 1) {
-          player.seek(resume);
-        }
-      },
+      onReady: () => setBuffering(false),
       onEnded: () => {
-        if (!cancelled) {
+        if (!cancelledRef.current) {
           onExit();
         }
       },
@@ -107,34 +173,14 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       try {
         await player.initialize();
         const detail = await api.getItem(itemId);
-        if (cancelled) {
+        if (cancelledRef.current) {
           return;
         }
         setItem(detail);
-        if (detail.RunTimeTicks) {
-          setDuration(ticksToSeconds(detail.RunTimeTicks));
-        }
-
-        const info = await api.getPlaybackInfo(itemId, {
-          profile: deviceProfile,
-          mediaSourceId,
-        });
-        if (cancelled) {
-          return;
-        }
-        const stream = resolveStream(api.session, itemId, info, mediaSourceId);
-        playMethodRef.current = stream.playMethod;
-        mediaSourceRef.current = stream.mediaSourceId;
-        playSessionRef.current = stream.playSessionId;
-
-        if (stream.isDirect) {
-          // Direct play cannot be fed to MSE; the API layer asks the server
-          // for a transcode, so this only happens if the server ignored that.
-          throw new Error('The server did not provide a stream this device can play.');
-        }
-        await player.load(stream.url, deviceProfile.MaxStreamingBitrate);
+        setDuration(ticksToSeconds(detail.RunTimeTicks));
+        await openStream(ticksToSeconds(startPositionTicks));
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelledRef.current) {
           setError((err as Error).message);
           setBuffering(false);
         }
@@ -142,7 +188,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     })();
 
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
       void player.destroy();
       playerRef.current = undefined;
     };
@@ -159,17 +205,59 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     };
   }, [showOsd]);
 
-  // Polls the playhead: the element's timeupdate event is not delivered on
-  // this platform when rendering through a detached surface.
+  // Polls the playhead: `timeupdate` is not delivered when rendering through a
+  // detached surface on this platform.
   useEffect(() => {
     const timer = setInterval(() => {
       const player = playerRef.current;
       if (player && !paused) {
-        setPosition(player.currentTime);
+        setPosition(streamStart.current + player.currentTime);
       }
     }, TICK_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [paused]);
+
+  // --- Tracks and subtitles ------------------------------------------------
+
+  const subtitleTracks = useMemo(() => tracks.filter(t => t.Type === 'Subtitle'), [tracks]);
+  const audioTracks = useMemo(() => tracks.filter(t => t.Type === 'Audio'), [tracks]);
+
+  /**
+   * Loads the selected subtitle track as WebVTT.
+   *
+   * Text tracks are rendered by the app, which is what makes the timing
+   * adjustable. Picture-based tracks have no client renderer, so those are
+   * burned in by the server and produce no cues here.
+   */
+  useEffect(() => {
+    const track = subtitleTracks.find(t => t.Index === subtitleIndex);
+    const source = mediaSourceRef.current;
+    if (!track || !source || track.IsTextSubtitleStream === false) {
+      setCues([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(api.subtitleUrl(itemId, source, track.Index));
+        const text = response.ok ? await response.text() : '';
+        if (!cancelled) {
+          setCues(text ? parseVtt(text) : []);
+        }
+      } catch {
+        if (!cancelled) {
+          setCues([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, itemId, subtitleIndex, subtitleTracks]);
+
+  useEffect(() => {
+    setCaption(cues.length ? cueAt(cues, position, subtitleOffset)?.text ?? '' : '');
+  }, [cues, position, subtitleOffset]);
 
   // --- Playback reporting -------------------------------------------------
 
@@ -180,11 +268,13 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       PlaySessionId: playSessionRef.current,
       PlayMethod: playMethodRef.current,
       PositionTicks: secondsToTicks(positionRef.current),
+      AudioStreamIndex: audioIndex,
+      SubtitleStreamIndex: subtitleIndex,
       CanSeek: true,
       IsPaused: false,
       ...extra,
     }),
-    [itemId],
+    [audioIndex, itemId, subtitleIndex],
   );
 
   useEffect(() => {
@@ -234,18 +324,39 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   const seekBy = useCallback(
     (delta: number) => {
-      const player = playerRef.current;
-      if (!player) {
-        return;
-      }
       const limit = durationRef.current;
-      const target = Math.max(0, Math.min(limit ? limit - 1 : Infinity, positionRef.current + delta));
-      setPosition(target);
-      setBuffering(true);
-      player.seek(target);
+      const target = Math.max(
+        0,
+        Math.min(limit ? limit - 5 : Number.MAX_SAFE_INTEGER, positionRef.current + delta),
+      );
       showOsd();
+      void openStream(target, audioIndex, subtitleIndex);
     },
-    [showOsd],
+    [audioIndex, openStream, showOsd, subtitleIndex],
+  );
+
+  const selectAudio = useCallback(
+    (index: number) => {
+      setAudioIndex(index);
+      setMenu('closed');
+      void openStream(positionRef.current, index, subtitleIndex);
+    },
+    [openStream, subtitleIndex],
+  );
+
+  const selectSubtitle = useCallback(
+    (index: number | undefined) => {
+      setSubtitleIndex(index);
+      setMenu('closed');
+      const track = subtitleTracks.find(t => t.Index === index);
+      // A picture-based track has to be burned in by the server, which needs a
+      // new stream. A text track is fetched separately, so the video keeps
+      // playing untouched.
+      if (track && track.IsTextSubtitleStream === false) {
+        void openStream(positionRef.current, audioIndex, index);
+      }
+    },
+    [audioIndex, openStream, subtitleTracks],
   );
 
   useTVEventHandler((event: HWEvent) => {
@@ -253,11 +364,16 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     if (event.eventKeyAction !== undefined && event.eventKeyAction !== 0) {
       return;
     }
+    // While the menu is open it owns the D-pad, so playback keys stand down.
+    if (menu !== 'closed') {
+      return;
+    }
     switch (event.eventType) {
-      case 'back':
       case 'stop':
         onExit();
         break;
+      // 'back' is intentionally not handled here: the router owns it, and
+      // popping the route unmounts this screen, which stops playback.
       case 'playpause':
       case 'select':
       case 'pause':
@@ -276,6 +392,8 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         seekBy(SEEK_LARGE);
         break;
       case 'up':
+        setMenu('root');
+        break;
       case 'down':
       case 'info':
         showOsd();
@@ -323,13 +441,33 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         style={StyleSheet.absoluteFill}
       />
 
+      {caption ? (
+        <View style={styles.captionBox} pointerEvents="none">
+          <Text style={styles.captionText}>{caption}</Text>
+        </View>
+      ) : null}
+
       {buffering ? (
         <View style={styles.bufferOverlay} pointerEvents="none">
           <ActivityIndicator color={colors.accent} size="large" />
         </View>
       ) : null}
 
-      {osdVisible ? (
+      {menu !== 'closed' ? (
+        <PlayerMenu
+          audioIndex={audioIndex}
+          audioTracks={audioTracks}
+          onClose={() => setMenu('closed')}
+          onSelectAudio={selectAudio}
+          onSelectSubtitle={selectSubtitle}
+          onSubtitleOffsetChange={setSubtitleOffset}
+          setState={setMenu}
+          state={menu}
+          subtitleIndex={subtitleIndex}
+          subtitleOffset={subtitleOffset}
+          subtitleTracks={subtitleTracks}
+        />
+      ) : osdVisible ? (
         <View style={styles.osd} pointerEvents="none">
           <Gradient
             id="osdGradient"
@@ -361,7 +499,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
             <View style={styles.statusRow}>
               <Text style={styles.statusText}>{paused ? '❚❚ Paused' : '▶ Playing'}</Text>
               <Text style={styles.statusHint}>
-                ◀ ▶ seek {SEEK_SMALL}s · OK play/pause · Back to exit
+                {'◀ ▶ seek · OK play/pause · ▲ audio & subtitles · Back to exit'}
               </Text>
             </View>
           </View>
@@ -377,6 +515,24 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  captionBox: {
+    alignItems: 'center',
+    bottom: 90,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+  },
+  captionText: {
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: radius.sm,
+    color: colors.text,
+    fontSize: 28,
+    lineHeight: 38,
+    overflow: 'hidden',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+    textAlign: 'center',
   },
   osd: {bottom: 0, height: 320, left: 0, position: 'absolute', right: 0},
   osdContent: {
@@ -397,11 +553,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginHorizontal: spacing.md,
   },
-  progressFill: {
-    backgroundColor: colors.accent,
-    borderRadius: radius.pill,
-    height: '100%',
-  },
+  progressFill: {backgroundColor: colors.accent, borderRadius: radius.pill, height: '100%'},
   progressKnob: {
     backgroundColor: colors.text,
     borderRadius: 9,

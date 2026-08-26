@@ -30,6 +30,7 @@ decoders.
 - Search across movies, series, episodes, albums, artists and collections
 - Video playback through Media Source Extensions, with a Jellyfin-styled
   on-screen display, seeking and pause
+- Audio-track and subtitle selection, with adjustable subtitle timing
 - Watch-state reporting, so progress syncs with every other Jellyfin client
 - Mark watched/unwatched and favourite from the detail page
 - Remembers the last server and account, and signs in again on launch
@@ -101,7 +102,8 @@ vega device start-log-stream
 | Playback | OK or Play/Pause | Toggle pause |
 | Playback | ◀ ▶ | Seek 10 seconds |
 | Playback | Rewind / Fast-forward | Seek 30 seconds |
-| Playback | Up / Down / Info | Show the on-screen display |
+| Playback | Down / Info | Show the on-screen display |
+| Playback | Up | Open audio, subtitle and timing settings |
 | Playback | Back | Stop and return |
 
 ## How it works
@@ -137,13 +139,30 @@ only way back on a TV.
 driven from remote key events, so the OSD never competes with the platform's
 spatial navigation.
 
-**Persistence uses `AsyncStorage`, not the file system module.**
-`@amazon-devices/kepler-file-system` looks like the right tool, but on Vega OS
-1.2 its `readFileAsString` and `writeStringToFile` fail with
-`com.amazon.kepler.io.IoError` for every path and every open mode — only
-`exists`, `getEntries` and `openFile` work, which is not enough to store
-anything. `AsyncStorage` from the Kepler runtime works, and is what holds the
-session, the device id and the remembered credentials.
+**Persistence uses `expo-file-system`, after two false starts.** Two more
+obvious options do not work on Vega OS 1.2:
+`@amazon-devices/kepler-file-system` fails every `readFileAsString` and
+`writeStringToFile` with `com.amazon.kepler.io.IoError`, for every path and
+every open mode — only `exists`, `getEntries` and `openFile` work, which is
+enough to create an empty file but not to store anything. `AsyncStorage` from
+the Kepler runtime accepts writes and reads them back within a session, but the
+data does not survive a restart, so it is effectively an in-memory cache.
+`@amazon-devices/expo-file-system` writes into `/data` and was verified to
+survive terminating and relaunching the app.
+
+**Back has to be *consumed*, not merely observed.** Watching for the Back key
+through `useTVEventHandler` leaves the platform's default behaviour in place,
+so the app closed even when there was somewhere to go back to. The router uses
+`useKeplerBackHandler` and returns `true` to claim the press; at the root it
+returns `false`, which lets the platform close the app — the behaviour a TV
+user expects.
+
+**Artwork falls forward when the server 404s.** An image tag only means the
+server has metadata for a picture, not that the file is still on disk. A
+library with missing artwork answers 404, which showed up as grey boxes in the
+"Continue Watching" and "Next Up" rows. `Artwork` walks a list of candidates on
+load failure, so a stale thumb tag degrades to the episode still, the series
+backdrop, and finally the poster.
 
 **The remembered password is stored in clear text.** It is private to the app
 and wiped on uninstall, but anyone with developer-mode access to the device can
@@ -197,8 +216,20 @@ Two consequences follow:
   `SourceBuffer`. Asking explicitly is what makes the manifest carry an
   `EXT-X-MAP` initialisation segment and `.mp4` fragments.
 
-Seeking discards the buffer and resumes from the segment covering the target.
-That is exact, because each fragment carries its own timestamps.
+**Seeking re-requests the stream.** Jellyfin transcodes a session
+sequentially, so asking for a segment far ahead of what it has produced simply
+hangs — the player waits forever for bytes the server has not reached. Seeking
+therefore asks for a *new* stream starting at the target, which is what the
+server is built to serve. The screen tracks where the current stream begins so
+the on-screen display still shows an absolute position. Changing the audio
+track works the same way.
+
+**Subtitles are rendered by the app.** Text tracks are fetched from Jellyfin as
+WebVTT, parsed, and drawn as an overlay. Doing it here rather than asking the
+server to burn them in is what makes the timing adjustable: an offset is simply
+added when looking up the cue for the current position. Picture-based tracks
+(PGS, VobSub) have no client renderer, so those are still burned in by the
+server, which means selecting one restarts the stream.
 
 ## Other limitations
 

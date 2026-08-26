@@ -3,6 +3,7 @@ import {buildDeviceProfile, type DeviceProfile} from './deviceProfile';
 import type {
   AuthenticationResult,
   BaseItemDto,
+  MediaStream,
   DeviceIdentity,
   ItemsResponse,
   PlaybackInfoResponse,
@@ -364,6 +365,10 @@ export interface ResolvedStream {
   playSessionId?: string;
   playMethod: 'DirectPlay' | 'DirectStream' | 'Transcode';
   container?: string;
+  /** Audio and subtitle tracks the item offers, for the player's menu. */
+  mediaStreams: MediaStream[];
+  defaultAudioIndex?: number;
+  defaultSubtitleIndex?: number;
 }
 
 /**
@@ -409,6 +414,9 @@ export function resolveStream(
       playSessionId: info.PlaySessionId,
       playMethod: 'Transcode',
       container: source.TranscodingContainer,
+      mediaStreams: source.MediaStreams ?? [],
+      defaultAudioIndex: source.DefaultAudioStreamIndex,
+      defaultSubtitleIndex: source.DefaultSubtitleStreamIndex,
     };
   }
 
@@ -426,6 +434,9 @@ export function resolveStream(
     playSessionId: info.PlaySessionId,
     playMethod: source.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
     container: source.Container,
+    mediaStreams: source.MediaStreams ?? [],
+    defaultAudioIndex: source.DefaultAudioStreamIndex,
+    defaultSubtitleIndex: source.DefaultSubtitleStreamIndex,
   };
 }
 

@@ -3,10 +3,11 @@ import {Image, ScrollView, StyleSheet, Text, View} from 'react-native';
 import {TVFocusGuideView} from '@amazon-devices/react-native-kepler';
 import {Button} from '../components/Button';
 import {Focusable} from '../components/Focusable';
+import {Artwork} from '../components/Artwork';
 import {Gradient} from '../components/Gradient';
 import {ErrorView, LoadingView, Screen} from '../components/Screen';
 import {Shelf} from '../components/Shelf';
-import {backdropUrl, logoUrl, posterUrl, thumbUrl} from '../api/images';
+import {backdropUrl, logoUrl, posterCandidates, thumbCandidates} from '../api/images';
 import {useApi, useApp} from '../state/AppContext';
 import {colors, radius, safeArea, spacing, typography} from '../theme/theme';
 import {
@@ -100,7 +101,10 @@ export const DetailScreen = ({itemId, onNavigate, onBack}: Props) => {
   const serverUrl = session?.serverUrl ?? '';
   const backdrop = useMemo(() => (item ? backdropUrl(serverUrl, item) : undefined), [item, serverUrl]);
   const logo = useMemo(() => (item ? logoUrl(serverUrl, item) : undefined), [item, serverUrl]);
-  const poster = useMemo(() => (item ? posterUrl(serverUrl, item, 480) : undefined), [item, serverUrl]);
+  const posterSources = useMemo(
+    () => (item ? posterCandidates(serverUrl, item, 480) : []),
+    [item, serverUrl],
+  );
 
   const play = useCallback(
     (target: BaseItemDto, resume: boolean) => {
@@ -195,8 +199,8 @@ export const DetailScreen = ({itemId, onNavigate, onBack}: Props) => {
           />
 
           <View style={styles.heroContent}>
-            {poster ? (
-              <Image source={{uri: poster}} style={styles.poster} resizeMode="cover" />
+            {posterSources.length ? (
+              <Artwork sources={posterSources} style={styles.poster} />
             ) : null}
 
             <View style={styles.heroText}>
@@ -400,18 +404,14 @@ const EpisodeRow = ({
   serverUrl: string;
   onPress: () => void;
 }) => {
-  const uri = thumbUrl(serverUrl, episode, 400);
+  const sources = thumbCandidates(serverUrl, episode, 400);
   const progress = watchedFraction(episode);
   return (
     <Focusable accessibilityLabel={episode.Name ?? 'Episode'} onPress={onPress}>
       {focused => (
         <View style={[styles.episodeRow, focused && styles.episodeRowFocused]}>
           <View style={styles.episodeThumbWrapper}>
-            {uri ? (
-              <Image source={{uri}} style={styles.episodeThumb} resizeMode="cover" />
-            ) : (
-              <View style={[styles.episodeThumb, styles.personPlaceholder]} />
-            )}
+            <Artwork sources={sources} style={styles.episodeThumb} />
             {progress > 0 && progress < 1 ? (
               <View style={styles.episodeProgressTrack}>
                 <View style={[styles.episodeProgressFill, {width: `${progress * 100}%`}]} />

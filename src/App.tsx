@@ -1,6 +1,6 @@
-import React, {useCallback} from 'react';
+import React, {useCallback, useEffect} from 'react';
 import {StatusBar} from 'react-native';
-import {useTVEventHandler, type HWEvent} from '@amazon-devices/react-native-kepler';
+import {useKeplerBackHandler} from '@amazon-devices/react-native-kepler';
 import {Screen, SplashView} from './components/Screen';
 import {ConnectScreen} from './screens/ConnectScreen';
 import {DetailScreen} from './screens/DetailScreen';
@@ -16,23 +16,26 @@ import {AppProvider, useApp} from './state/AppContext';
  * Renders the current route and wires the remote's Back key to the stack.
  *
  * Back is handled here rather than per screen so there is exactly one place
- * that decides what "backwards" means. The player is the exception: it
- * consumes Back itself, since it also needs to stop playback.
+ * that decides what "backwards" means.
+ *
+ * `KeplerBackHandler` is used rather than a raw key listener because it is the
+ * only way to *consume* the press. Observing Back through `useTVEventHandler`
+ * leaves the platform's default in place, so the app closed even when there
+ * was somewhere to go back to. Returning `true` here claims the press;
+ * returning `false` at the root lets the platform close the app, which is the
+ * behaviour a TV user expects.
  */
 const Router = () => {
   const navigation = useNavigation();
   const route = navigation.current;
-  const isPlayer = route.name === 'player';
+  const backHandler = useKeplerBackHandler();
 
-  useTVEventHandler((event: HWEvent) => {
-    if (event.eventKeyAction !== undefined && event.eventKeyAction !== 0) {
-      return;
-    }
-    if (event.eventType !== 'back' || isPlayer) {
-      return;
-    }
-    navigation.pop();
-  });
+  useEffect(() => {
+    const subscription = backHandler.addEventListener('hardwareBackPress', () =>
+      navigation.pop(),
+    );
+    return () => subscription.remove();
+  }, [backHandler, navigation]);
 
   const navigate = useCallback(
     (next: Parameters<typeof navigation.push>[0]) => {

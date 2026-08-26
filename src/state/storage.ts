@@ -1,56 +1,66 @@
-import {AsyncStorage} from '@amazon-devices/react-native-kepler';
+import * as FileSystem from '@amazon-devices/expo-file-system';
 import type {DeviceIdentity, Session} from '../api/types';
 
 /**
  * Persistence for the signed-in session, the device identity, and the
  * remembered sign-in details.
  *
- * `AsyncStorage` from the Kepler runtime is used rather than
- * `@amazon-devices/kepler-file-system`: on Vega OS 1.2 that module's
- * `readFileAsString` and `writeStringToFile` fail with
- * `com.amazon.kepler.io.IoError` for every path and open mode, so nothing
- * written through it survives. Only `exists`, `getEntries` and `openFile`
- * work there, which is not enough to store anything.
+ * `expo-file-system` is used because the two more obvious choices do not work
+ * on Vega OS 1.2:
  *
- * Storage is private to the app and cleared when it is uninstalled.
+ * - `@amazon-devices/kepler-file-system` fails every `readFileAsString` and
+ *   `writeStringToFile` with `com.amazon.kepler.io.IoError`, for every path and
+ *   every open mode. Only `exists`, `getEntries` and `openFile` work, which is
+ *   enough to create an empty file and list it, but not to store anything.
+ * - `AsyncStorage` from the Kepler runtime accepts writes and reads them back
+ *   within a session, but the data does not survive a restart, so it behaves as
+ *   an in-memory cache.
+ *
+ * `expo-file-system` writes into `/data`, the app's private directory, and was
+ * verified to survive terminating and relaunching the app. It is cleared when
+ * the app is uninstalled.
  */
-const SESSION_KEY = 'jellyfin.session';
-const DEVICE_KEY = 'jellyfin.deviceId';
-const CREDENTIALS_KEY = 'jellyfin.credentials';
+const SESSION_FILE = 'session.json';
+const DEVICE_FILE = 'device.json';
+const CREDENTIALS_FILE = 'credentials.json';
 
-async function readJson<T>(key: string): Promise<T | undefined> {
+function pathFor(name: string): string {
+  return `${FileSystem.documentDirectory ?? '/data/'}${name}`;
+}
+
+async function readJson<T>(name: string): Promise<T | undefined> {
   try {
-    const raw = await AsyncStorage.getItem(key);
+    const raw = await FileSystem.readAsStringAsync(pathFor(name));
     return raw ? (JSON.parse(raw) as T) : undefined;
   } catch {
-    // A corrupt or unreadable value must not stop the app from starting; the
-    // user simply lands back on the sign-in screen.
+    // Missing, corrupt, or unreadable: the app starts at the sign-in screen
+    // rather than failing to launch.
     return undefined;
   }
 }
 
-async function writeJson(key: string, value: unknown): Promise<void> {
-  await AsyncStorage.setItem(key, JSON.stringify(value));
+async function writeJson(name: string, value: unknown): Promise<void> {
+  await FileSystem.writeAsStringAsync(pathFor(name), JSON.stringify(value));
 }
 
-async function remove(key: string): Promise<void> {
+async function remove(name: string): Promise<void> {
   try {
-    await AsyncStorage.removeItem(key);
+    await FileSystem.deleteAsync(pathFor(name), {idempotent: true});
   } catch {
     // Nothing actionable: the in-memory state is dropped regardless.
   }
 }
 
 export function loadSession(): Promise<Session | undefined> {
-  return readJson<Session>(SESSION_KEY);
+  return readJson<Session>(SESSION_FILE);
 }
 
 export async function saveSession(session: Session): Promise<void> {
-  await writeJson(SESSION_KEY, session);
+  await writeJson(SESSION_FILE, session);
 }
 
 export function clearSession(): Promise<void> {
-  return remove(SESSION_KEY);
+  return remove(SESSION_FILE);
 }
 
 /**
@@ -69,19 +79,19 @@ export interface RememberedCredentials {
 }
 
 export function loadCredentials(): Promise<RememberedCredentials | undefined> {
-  return readJson<RememberedCredentials>(CREDENTIALS_KEY);
+  return readJson<RememberedCredentials>(CREDENTIALS_FILE);
 }
 
 export async function saveCredentials(credentials: RememberedCredentials): Promise<void> {
   try {
-    await writeJson(CREDENTIALS_KEY, credentials);
+    await writeJson(CREDENTIALS_FILE, credentials);
   } catch {
     // Convenience only: failing to remember must never block signing in.
   }
 }
 
 export function clearCredentials(): Promise<void> {
-  return remove(CREDENTIALS_KEY);
+  return remove(CREDENTIALS_FILE);
 }
 
 /**
@@ -91,13 +101,13 @@ export function clearCredentials(): Promise<void> {
  * fresh id on every launch would fill the server's dashboard with entries.
  */
 export async function loadOrCreateDeviceId(): Promise<string> {
-  const stored = await readJson<{deviceId?: string}>(DEVICE_KEY);
+  const stored = await readJson<{deviceId?: string}>(DEVICE_FILE);
   if (stored?.deviceId) {
     return stored.deviceId;
   }
   const deviceId = generateDeviceId();
   try {
-    await writeJson(DEVICE_KEY, {deviceId});
+    await writeJson(DEVICE_FILE, {deviceId});
   } catch {
     // If it cannot be persisted the app still works for this session.
   }

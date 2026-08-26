@@ -37,6 +37,18 @@ id = "/com.amazon.kepler.svg_3@ISVG_0"
 [[needs.module]]
 id = "/com.amazon.kepler.w3cmedia_2@IW3cmedia_3"
 
+[[needs.module]]
+id = "/com.amazon.kepler.expo_file_system_2@IExpoFileSystem_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.expo_sqlite_2@IExpoSQLite_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.kepler_identifiers_0@IKeplerIdentifiers_0"
+
+
+
+
 [wants]
 # Required for <TextInput> to reach the on-screen keyboard. Without it a focused
 # field never opens the keyboard, and the only clue is

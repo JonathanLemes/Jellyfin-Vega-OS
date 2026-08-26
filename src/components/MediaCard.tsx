@@ -1,8 +1,9 @@
 import React, {useMemo} from 'react';
 import {Image, StyleSheet, Text, View} from 'react-native';
+import {Artwork} from './Artwork';
 import {Focusable} from './Focusable';
 import {colors, focusRing, focusScale, poster, radius, spacing} from '../theme/theme';
-import {posterUrl, thumbUrl} from '../api/images';
+import {posterCandidates, thumbCandidates} from '../api/images';
 import {episodeLabel, subtitleFor, titleFor, watchedFraction} from '../utils/format';
 import type {BaseItemDto} from '../api/types';
 
@@ -39,11 +40,11 @@ export const MediaCard = ({
     ? {width: poster.width, height: poster.width}
     : {width: poster.width, height: poster.height};
 
-  const uri = useMemo(
+  const sources = useMemo(
     () =>
       shape === 'wide'
-        ? thumbUrl(serverUrl, item, Math.round(size.width * 1.5))
-        : posterUrl(serverUrl, item, Math.round(size.height * 1.5)),
+        ? thumbCandidates(serverUrl, item, Math.round(size.width * 1.5))
+        : posterCandidates(serverUrl, item, Math.round(size.height * 1.5)),
     [item, serverUrl, shape, size.height, size.width],
   );
 
@@ -67,15 +68,11 @@ export const MediaCard = ({
               focused && focusRing,
               focused && {transform: [{scale: focusScale}]},
             ]}>
-            {uri ? (
-              <Image source={{uri}} style={styles.image} resizeMode="cover" />
-            ) : (
-              <View style={styles.placeholder}>
-                <Text style={styles.placeholderText} numberOfLines={3}>
-                  {titleFor(item)}
-                </Text>
-              </View>
-            )}
+            <Artwork
+              fallbackText={titleFor(item)}
+              sources={sources}
+              style={styles.image}
+            />
 
             {unplayed > 0 ? (
               <View style={styles.badge}>

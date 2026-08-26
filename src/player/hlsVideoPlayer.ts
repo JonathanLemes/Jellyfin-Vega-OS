@@ -89,6 +89,14 @@ export class HlsVideoPlayer {
    * ceiling it advertised to the server.
    */
   async load(masterUrl: string, maxBandwidth: number): Promise<void> {
+    // Every load gets a fresh MediaSource. Reusing one after a seek leaves the
+    // old buffered timeline in place, and the element then waits forever for
+    // data at a position the new stream never produces.
+    this.stopPump();
+    this.started = false;
+    this.queue = undefined;
+    this.mediaSource = new MediaSource();
+
     const masterText = await this.fetchText(masterUrl);
     const variants = parseMasterPlaylist(masterText);
     const variant = selectVariant(variants, maxBandwidth);
@@ -228,32 +236,17 @@ export class HlsVideoPlayer {
   }
 
   /**
-   * Seeks by discarding the buffer and resuming from the segment covering the
-   * target, which is exact because each fragment carries its own timestamps.
+   * Restarts playback after the surface or stream changed.
+   *
+   * Seeking is deliberately *not* done by jumping to a later segment. Jellyfin
+   * transcodes a session sequentially, so asking for a segment far ahead of
+   * what it has produced simply hangs. The screen instead re-requests the
+   * stream from the server with a new start offset and calls `load` again,
+   * which is what the server is built to serve.
    */
-  seek(targetSeconds: number): void {
-    const playlist = this.playlist;
-    if (!playlist || !this.queue) {
-      return;
-    }
-    const clamped = Math.max(0, Math.min(playlist.totalDurationSeconds - 1, targetSeconds));
-    let index = playlist.segments.findIndex(
-      s => clamped >= s.startSeconds && clamped < s.startSeconds + s.durationSeconds,
-    );
-    if (index < 0) {
-      index = playlist.segments.length - 1;
-    }
-
-    this.queue.clear();
-    this.nextSegment = index;
-    try {
-      this.player.currentTime = playlist.segments[index].startSeconds;
-    } catch {
-      // The element rejects seeks before it has data; the pump will catch up.
-    }
-    // The init segment has to be re-sent after the buffer is emptied.
-    void this.appendInit().catch(() => undefined);
-    this.startPump();
+  restart(): void {
+    this.started = false;
+    this.maybeStart();
   }
 
   play(): void {
