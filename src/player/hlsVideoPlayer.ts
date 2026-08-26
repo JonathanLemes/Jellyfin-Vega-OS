@@ -54,8 +54,6 @@ export class HlsVideoPlayer {
   private started = false;
   /** Position the element should jump to once data is buffered there. */
   private pendingSeek?: number;
-  /** Timeline position to place the next append at, after a seek. */
-  private pendingOffset?: number;
   private seekAttempts = 0;
 
   constructor(private readonly callbacks: HlsPlayerCallbacks) {}
@@ -222,12 +220,7 @@ export class HlsVideoPlayer {
     const segment = playlist.segments[this.nextSegment];
     this.nextSegment += 1;
     try {
-      const bytes = await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri));
-      // Only the first append of a run carries an offset; sequence mode
-      // continues the timeline for the ones after it.
-      const offset = this.pendingOffset;
-      this.pendingOffset = undefined;
-      this.queue.push(bytes, offset);
+      this.queue.push(await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri)));
       this.applyPendingSeek();
     } catch (error) {
       // Rewind so the segment is retried on the next tick rather than leaving
@@ -276,9 +269,6 @@ export class HlsVideoPlayer {
 
     this.queue.clear();
     this.nextSegment = index;
-    // Place the resumed run at the segment's real start, not at the target, so
-    // the few seconds before the target stay seekable.
-    this.pendingOffset = playlist.segments[index].startSeconds;
     this.pendingSeek = target;
     this.seekAttempts = 0;
     this.startPump();

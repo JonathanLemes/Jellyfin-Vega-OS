@@ -1,21 +1,14 @@
 import {AppendMode, type SourceBuffer} from '@amazon-devices/react-native-w3cmedia';
 
-interface PendingAppend {
-  data: ArrayBuffer;
-  /** Timeline position this buffer should land at, in seconds. */
-  timestampOffset?: number;
-}
-
 /**
  * Serialises appends into a `SourceBuffer`.
  *
  * MSE rejects an `appendBuffer` while a previous one is still updating, so
- * every write has to queue behind `updateend`. `timestampOffset` has the same
- * restriction, which is why placing a buffer on the timeline belongs here
- * rather than at the call site.
+ * every write has to queue behind `updateend`. This also owns the `remove()`
+ * used when seeking, for the same reason.
  */
 export class AppendQueue {
-  private pending: PendingAppend[] = [];
+  private pending: ArrayBuffer[] = [];
   private failed = false;
   private removing = false;
 
@@ -23,15 +16,16 @@ export class AppendQueue {
     private readonly sourceBuffer: SourceBuffer,
     private readonly onError: (message: string) => void,
   ) {
-    // Sequence mode lays each append immediately after the previous one and
-    // ignores whatever timestamps the fragment carries internally. Jellyfin's
-    // fragments start at zero whenever it restarts a transcode, so trusting
-    // them would stack every segment on top of the first.
+    // Segments mode: each fragment is placed using the timestamps it carries.
+    // Jellyfin writes absolute decode times -- segment 500 of a six-second
+    // playlist really does start at ~3000s -- so a fragment lands at its true
+    // position without any offset arithmetic, which is what makes seeking by
+    // segment index land where it should.
     try {
-      this.sourceBuffer.mode = AppendMode.sequence;
+      this.sourceBuffer.mode = AppendMode.segments;
     } catch {
-      // Some builds fix the mode once a buffer has data; the explicit
-      // timestampOffset below still places the run correctly.
+      // Some builds fix the mode once the buffer has data; the default is
+      // already 'segments' for fragmented MP4.
     }
     this.sourceBuffer.onupdateend = () => {
       this.removing = false;
@@ -44,18 +38,11 @@ export class AppendQueue {
     };
   }
 
-  /**
-   * Queues a buffer.
-   *
-   * `timestampOffset` is applied just before the append, and only needs to be
-   * given for the first buffer of a run; sequence mode carries the timeline
-   * forward from there.
-   */
-  push(data: ArrayBuffer, timestampOffset?: number): void {
+  push(data: ArrayBuffer): void {
     if (this.failed) {
       return;
     }
-    this.pending.push({data, timestampOffset});
+    this.pending.push(data);
     this.flush();
   }
 
@@ -86,10 +73,7 @@ export class AppendQueue {
       return;
     }
     try {
-      if (next.timestampOffset !== undefined) {
-        this.sourceBuffer.timestampOffset = next.timestampOffset;
-      }
-      this.sourceBuffer.appendBuffer(next.data);
+      this.sourceBuffer.appendBuffer(next);
     } catch (error) {
       this.failed = true;
       this.pending = [];

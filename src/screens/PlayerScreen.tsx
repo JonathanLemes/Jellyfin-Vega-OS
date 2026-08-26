@@ -72,6 +72,10 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   const mediaSourceRef = useRef<string | undefined>(undefined);
   const playSessionRef = useRef<string | undefined>(undefined);
   const startedRef = useRef(false);
+  // Target of an in-flight seek, so repeated presses accumulate instead of
+  // each one re-reading a playhead that has not moved yet.
+  const seekTargetRef = useRef<number | undefined>(undefined);
+  const seekSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const cancelledRef = useRef(false);
   // Rejects results from a stream request that a newer one has superseded.
   const loadToken = useRef(0);
@@ -331,10 +335,21 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         return;
       }
       const limit = durationRef.current;
+      const from = seekTargetRef.current ?? positionRef.current;
       const target = Math.max(
         0,
-        Math.min(limit ? limit - 5 : Number.MAX_SAFE_INTEGER, positionRef.current + delta),
+        Math.min(limit ? limit - 5 : Number.MAX_SAFE_INTEGER, from + delta),
       );
+      seekTargetRef.current = target;
+      if (seekSettleTimer.current) {
+        clearTimeout(seekSettleTimer.current);
+      }
+      // Released once playback has had a chance to reach the target, so the
+      // next press starts from where the video actually is.
+      seekSettleTimer.current = setTimeout(() => {
+        seekTargetRef.current = undefined;
+      }, 4000);
+
       // Seeking happens inside the playlist the server already gave us. The
       // HLS playlist always spans the whole item, so re-requesting it would
       // just start the video from the beginning again.

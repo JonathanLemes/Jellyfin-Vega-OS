@@ -223,12 +223,17 @@ re-requesting the stream on a seek only ever restarts the video from the
 beginning. Instead the buffer is dropped, appending resumes from the segment
 covering the target, and the element is told to jump there.
 
-Two details make that work. The `SourceBuffer` runs in **sequence mode** with an
-explicit `timestampOffset` for the first append after a seek: Jellyfin's
-fragments start their timestamps at zero whenever it restarts a transcode, so
-trusting them would stack every segment on top of the first. And the jump is
+Two details make that work. The `SourceBuffer` runs in **segments mode**, which
+places each fragment using the timestamps it carries: Jellyfin writes absolute
+decode times, so segment 500 of a six-second playlist really does report ~3000s
+and lands at its true position with no offset arithmetic. And the jump is
 re-asserted after each append until the playhead agrees, because `currentTime`
-is only honoured once data is actually buffered there.
+is only honoured once data is actually buffered there — gating on `buffered`
+alone proved unreliable on this platform.
+
+Repeated presses accumulate against the pending target rather than the current
+playhead, so holding fast-forward moves in 30-second steps instead of
+repeatedly re-reading a position that has not caught up yet.
 
 Changing the audio track *is* a different stream, so that one is re-requested
 and resumed at the current position.
