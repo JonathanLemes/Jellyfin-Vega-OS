@@ -231,9 +231,18 @@ re-asserted after each append until the playhead agrees, because `currentTime`
 is only honoured once data is actually buffered there — gating on `buffered`
 alone proved unreliable on this platform.
 
-Repeated presses accumulate against the pending target rather than the current
-playhead, so holding fast-forward moves in 30-second steps instead of
-repeatedly re-reading a position that has not caught up yet.
+Seeking is **debounced**: pressing fast-forward moves the cursor immediately
+and accumulates against the pending target, but the stream only moves once the
+user stops pressing. Committing on every press tore the buffer down and rebuilt
+it repeatedly, which left the picture stuck. While the user is scrubbing, the
+playhead poll stands down so the cursor does not snap back to the real
+position between presses.
+
+The player reports back when a seek has actually landed. Without that signal
+the screen has no way to know the jump finished, and the loading indicator
+stays up forever — which is precisely what happened. There is also a bounded
+number of attempts, so a seek that never settles gives up and hands control
+back rather than spinning indefinitely.
 
 Changing the audio track *is* a different stream, so that one is re-requested
 and resumed at the current position.

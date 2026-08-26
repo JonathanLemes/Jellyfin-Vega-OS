@@ -11,6 +11,8 @@ export class AppendQueue {
   private pending: ArrayBuffer[] = [];
   private failed = false;
   private removing = false;
+  /** Set when a clear arrived mid-update and still has to happen. */
+  private clearRequested = false;
 
   constructor(
     private readonly sourceBuffer: SourceBuffer,
@@ -29,6 +31,11 @@ export class AppendQueue {
     }
     this.sourceBuffer.onupdateend = () => {
       this.removing = false;
+      if (this.clearRequested) {
+        this.clearRequested = false;
+        this.clear();
+        return;
+      }
       this.flush();
     };
     this.sourceBuffer.onerror = () => {
@@ -49,7 +56,13 @@ export class AppendQueue {
   /** Drops everything buffered; used before seeking to a new position. */
   clear(): void {
     this.pending = [];
-    if (this.failed || this.sourceBuffer.updating) {
+    if (this.failed) {
+      return;
+    }
+    if (this.sourceBuffer.updating) {
+      // Deferred to `updateend`; dropping it here would leave the old range
+      // in place while new segments append somewhere else on the timeline.
+      this.clearRequested = true;
       return;
     }
     try {
@@ -61,7 +74,12 @@ export class AppendQueue {
   }
 
   get idle(): boolean {
-    return !this.pending.length && !this.sourceBuffer.updating && !this.removing;
+    return (
+      !this.pending.length &&
+      !this.sourceBuffer.updating &&
+      !this.removing &&
+      !this.clearRequested
+    );
   }
 
   private flush(): void {

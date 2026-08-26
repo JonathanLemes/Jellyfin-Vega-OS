@@ -36,6 +36,8 @@ const MAX_SEEK_ATTEMPTS = 40;
 export interface HlsPlayerCallbacks {
   onError(message: string): void;
   onReady(durationSeconds: number): void;
+  /** Fired once a requested seek has actually moved the playhead. */
+  onSeeked(positionSeconds: number): void;
   /** Fired when every segment has been appended. */
   onEnded(): void;
 }
@@ -55,6 +57,8 @@ export class HlsVideoPlayer {
   /** Position the element should jump to once data is buffered there. */
   private pendingSeek?: number;
   private seekAttempts = 0;
+  /** True once `currentTime` has been assigned for the pending seek. */
+  private seekApplied = false;
 
   constructor(private readonly callbacks: HlsPlayerCallbacks) {}
 
@@ -197,7 +201,13 @@ export class HlsVideoPlayer {
   /** Fetches the next segment when the buffer has drained below the target. */
   private async fill(): Promise<void> {
     const playlist = this.playlist;
-    if (this.destroyed || !playlist || !this.queue || !this.queue.idle) {
+    if (this.destroyed || !playlist || !this.queue) {
+      return;
+    }
+    // Runs every tick, not only after a fetch, so a seek can settle once the
+    // decoder catches up without needing more data.
+    this.applyPendingSeek();
+    if (!this.queue.idle) {
       return;
     }
     if (this.nextSegment >= playlist.segments.length) {
@@ -211,10 +221,17 @@ export class HlsVideoPlayer {
       return;
     }
 
-    const bufferedEnd = this.bufferedEnd();
-    const position = this.pendingSeek ?? this.player.currentTime ?? 0;
-    if (bufferedEnd - position > BUFFER_AHEAD_SECONDS) {
-      return;
+    // While a seek is outstanding, fetch unconditionally. The buffered range
+    // still reflects the *old* position until the removal completes, so the
+    // usual "enough buffered" test would decide no fetch is needed, never
+    // append, and therefore never let the seek settle -- a deadlock that
+    // shows as a spinner that never goes away.
+    if (this.pendingSeek === undefined) {
+      const bufferedEnd = this.bufferedEnd();
+      const position = this.player.currentTime ?? 0;
+      if (bufferedEnd - position > BUFFER_AHEAD_SECONDS) {
+        return;
+      }
     }
 
     const segment = playlist.segments[this.nextSegment];
@@ -230,6 +247,22 @@ export class HlsVideoPlayer {
         this.callbacks.onError(`Could not load the stream: ${(error as Error)?.message}`);
       }
     }
+  }
+
+  private bufferedCovers(seconds: number): boolean {
+    try {
+      const buffered = this.player.buffered;
+      for (let i = 0; i < (buffered?.length ?? 0); i += 1) {
+        // A small tolerance: the fragment boundary rarely lands exactly on the
+        // requested second.
+        if (seconds >= buffered.start(i) - 1 && seconds < buffered.end(i)) {
+          return true;
+        }
+      }
+    } catch {
+      // Unknown; treated as not buffered so the caller waits for more data.
+    }
+    return false;
   }
 
   private bufferedEnd(): number {
@@ -271,6 +304,7 @@ export class HlsVideoPlayer {
     this.nextSegment = index;
     this.pendingSeek = target;
     this.seekAttempts = 0;
+    this.seekApplied = false;
     this.startPump();
   }
 
@@ -285,30 +319,44 @@ export class HlsVideoPlayer {
     if (target === undefined) {
       return;
     }
+
+    const current = this.player.currentTime ?? 0;
+    if (this.seekApplied && Math.abs(current - target) < SEEK_TOLERANCE_SECONDS) {
+      this.finishSeek(current);
+      return;
+    }
+    if (this.seekAttempts >= MAX_SEEK_ATTEMPTS) {
+      // Stop rather than fighting the element forever. Playback carries on
+      // from wherever it actually is, and -- importantly -- the screen is told,
+      // so it stops showing a spinner.
+      this.finishSeek(current);
+      return;
+    }
+    this.seekAttempts += 1;
+
     if (!this.bufferedCovers(target)) {
+      // The data is not there yet; asking again now would only reset the
+      // pipeline. The pump keeps fetching because a pending seek bypasses the
+      // "enough buffered" test.
       return;
     }
     try {
       this.player.currentTime = target;
-      this.pendingSeek = undefined;
+      this.seekApplied = true;
+      void this.player.play();
     } catch {
-      // Retried on the next fill.
+      // Retried on the next tick.
     }
   }
 
-  private bufferedCovers(seconds: number): boolean {
-    try {
-      const buffered = this.player.buffered;
-      for (let i = 0; i < (buffered?.length ?? 0); i += 1) {
-        if (seconds >= buffered.start(i) && seconds < buffered.end(i)) {
-          return true;
-        }
-      }
-    } catch {
-      // Treated as not buffered.
-    }
-    return false;
+  private finishSeek(position: number): void {
+    this.pendingSeek = undefined;
+    this.seekAttempts = 0;
+    this.seekApplied = false;
+    void this.player.play();
+    this.callbacks.onSeeked(position);
   }
+
 
   play(): void {
     void this.player.play();

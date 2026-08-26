@@ -29,6 +29,8 @@ const OSD_TIMEOUT_MS = 4000;
 const PROGRESS_INTERVAL_MS = 10000;
 /** How often the OSD re-reads the playhead. */
 const TICK_INTERVAL_MS = 250;
+/** Quiet period after the last seek press before the stream actually moves. */
+const SCRUB_COMMIT_MS = 700;
 
 /**
  * Full-screen video playback with a Jellyfin-style on-screen display.
@@ -72,10 +74,11 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   const mediaSourceRef = useRef<string | undefined>(undefined);
   const playSessionRef = useRef<string | undefined>(undefined);
   const startedRef = useRef(false);
-  // Target of an in-flight seek, so repeated presses accumulate instead of
-  // each one re-reading a playhead that has not moved yet.
-  const seekTargetRef = useRef<number | undefined>(undefined);
-  const seekSettleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Where the user is scrubbing to. While this is set the OSD shows it and
+  // the playhead poll stands down, so the cursor does not snap back to the
+  // real position between presses.
+  const scrubTargetRef = useRef<number | undefined>(undefined);
+  const scrubTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const cancelledRef = useRef(false);
   // Rejects results from a stream request that a newer one has superseded.
   const loadToken = useRef(0);
@@ -161,6 +164,11 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
           setBuffering(false);
         }
       },
+      onSeeked: landed => {
+        scrubTargetRef.current = undefined;
+        setPosition(landed);
+        setBuffering(false);
+      },
       onReady: total => {
         setBuffering(false);
         // Trust the item's runtime when it has one; otherwise the playlist is
@@ -195,6 +203,9 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
     return () => {
       cancelledRef.current = true;
+      if (scrubTimer.current) {
+        clearTimeout(scrubTimer.current);
+      }
       void player.destroy();
       playerRef.current = undefined;
     };
@@ -216,7 +227,9 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   useEffect(() => {
     const timer = setInterval(() => {
       const player = playerRef.current;
-      if (player && !paused) {
+      // While scrubbing, the OSD shows where the user is heading; overwriting
+      // it with the real playhead is what made the cursor jump back.
+      if (player && !paused && scrubTargetRef.current === undefined) {
         setPosition(player.currentTime);
       }
     }, TICK_INTERVAL_MS);
@@ -335,28 +348,28 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         return;
       }
       const limit = durationRef.current;
-      const from = seekTargetRef.current ?? positionRef.current;
+      // Accumulate against the pending target so holding the key keeps
+      // advancing, rather than re-reading a playhead that has not moved.
+      const from = scrubTargetRef.current ?? positionRef.current;
       const target = Math.max(
         0,
         Math.min(limit ? limit - 5 : Number.MAX_SAFE_INTEGER, from + delta),
       );
-      seekTargetRef.current = target;
-      if (seekSettleTimer.current) {
-        clearTimeout(seekSettleTimer.current);
-      }
-      // Released once playback has had a chance to reach the target, so the
-      // next press starts from where the video actually is.
-      seekSettleTimer.current = setTimeout(() => {
-        seekTargetRef.current = undefined;
-      }, 4000);
-
-      // Seeking happens inside the playlist the server already gave us. The
-      // HLS playlist always spans the whole item, so re-requesting it would
-      // just start the video from the beginning again.
+      scrubTargetRef.current = target;
       setPosition(target);
-      setBuffering(true);
-      player.seek(target);
       showOsd();
+
+      // The seek itself waits until the user stops pressing. Firing on every
+      // press would tear down and refill the buffer repeatedly, which is slow
+      // and leaves the picture stuck.
+      if (scrubTimer.current) {
+        clearTimeout(scrubTimer.current);
+      }
+      scrubTimer.current = setTimeout(() => {
+        scrubTimer.current = undefined;
+        setBuffering(true);
+        player.seek(target);
+      }, SCRUB_COMMIT_MS);
     },
     [showOsd],
   );
