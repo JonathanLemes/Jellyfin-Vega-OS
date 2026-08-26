@@ -36,12 +36,11 @@ const TICK_INTERVAL_MS = 250;
  * Playback goes through `HlsVideoPlayer`, which feeds fragmented-MP4 segments
  * into Media Source Extensions: Vega OS will not open a media URL.
  *
- * Seeking and track changes both re-request the stream from the server at a new
- * offset rather than moving within the current one. Jellyfin transcodes a
- * session sequentially, so jumping to a segment it has not produced yet simply
- * hangs; asking for a new stream starting at the target is what the server is
- * built to serve. `streamStart` records where the current stream begins so the
- * OSD can still show an absolute position.
+ * Seeking happens inside the loaded playlist: an HLS playlist always spans the
+ * whole item, and `StartTimeTicks` does not shift it, so re-requesting the
+ * stream only ever restarts the video from the beginning. Changing the audio
+ * track is different -- that genuinely is another stream -- and is re-requested
+ * and resumed at the current position.
  */
 export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onExit}: Props) => {
   const api = useApi();
@@ -69,7 +68,6 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   // otherwise capture stale values.
   const positionRef = useRef(ticksToSeconds(startPositionTicks));
   const durationRef = useRef(0);
-  const streamStart = useRef(0);
   const playMethodRef = useRef<string | undefined>(undefined);
   const mediaSourceRef = useRef<string | undefined>(undefined);
   const playSessionRef = useRef<string | undefined>(undefined);
@@ -104,7 +102,6 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       const token = ++loadToken.current;
       setBuffering(true);
       setError(undefined);
-      streamStart.current = atSeconds;
       setPosition(atSeconds);
 
       try {
@@ -133,7 +130,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         if (stream.isDirect) {
           throw new Error('The server did not provide a stream this device can play.');
         }
-        await player.load(stream.url, deviceProfile.MaxStreamingBitrate);
+        await player.load(stream.url, deviceProfile.MaxStreamingBitrate, atSeconds);
         if (cancelledRef.current || token !== loadToken.current) {
           return;
         }
@@ -160,7 +157,12 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
           setBuffering(false);
         }
       },
-      onReady: () => setBuffering(false),
+      onReady: total => {
+        setBuffering(false);
+        // Trust the item's runtime when it has one; otherwise the playlist is
+        // the only source of truth for how long the stream is.
+        setDuration(current => (current > 0 ? current : total));
+      },
       onEnded: () => {
         if (!cancelledRef.current) {
           onExit();
@@ -211,7 +213,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
     const timer = setInterval(() => {
       const player = playerRef.current;
       if (player && !paused) {
-        setPosition(streamStart.current + player.currentTime);
+        setPosition(player.currentTime);
       }
     }, TICK_INTERVAL_MS);
     return () => clearInterval(timer);
@@ -324,21 +326,32 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   const seekBy = useCallback(
     (delta: number) => {
+      const player = playerRef.current;
+      if (!player) {
+        return;
+      }
       const limit = durationRef.current;
       const target = Math.max(
         0,
         Math.min(limit ? limit - 5 : Number.MAX_SAFE_INTEGER, positionRef.current + delta),
       );
+      // Seeking happens inside the playlist the server already gave us. The
+      // HLS playlist always spans the whole item, so re-requesting it would
+      // just start the video from the beginning again.
+      setPosition(target);
+      setBuffering(true);
+      player.seek(target);
       showOsd();
-      void openStream(target, audioIndex, subtitleIndex);
     },
-    [audioIndex, openStream, showOsd, subtitleIndex],
+    [showOsd],
   );
 
   const selectAudio = useCallback(
     (index: number) => {
       setAudioIndex(index);
       setMenu('closed');
+      // A different audio track is a different stream, so this one does have
+      // to be re-requested -- resumed at the current position.
       void openStream(positionRef.current, index, subtitleIndex);
     },
     [openStream, subtitleIndex],
@@ -385,9 +398,13 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
       case 'right':
         seekBy(SEEK_SMALL);
         break;
+      // Vega reports the transport keys as 'rewind'/'forward'; the
+      // 'skip_*' names are kept for remotes that use the HTML naming.
+      case 'rewind':
       case 'skip_backward':
         seekBy(-SEEK_LARGE);
         break;
+      case 'forward':
       case 'skip_forward':
         seekBy(SEEK_LARGE);
         break;

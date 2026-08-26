@@ -1,4 +1,4 @@
-import {AppendMode, MediaSource, VideoPlayer} from '@amazon-devices/react-native-w3cmedia';
+import {MediaSource, VideoPlayer} from '@amazon-devices/react-native-w3cmedia';
 import {AppendQueue} from './appendQueue';
 import {
   mimeTypeFor,
@@ -28,6 +28,10 @@ import {
 const BUFFER_AHEAD_SECONDS = 30;
 /** How often to consider fetching the next segment. */
 const PUMP_INTERVAL_MS = 500;
+/** How close the playhead must land for a seek to count as done. */
+const SEEK_TOLERANCE_SECONDS = 2;
+/** Bounded so a stubborn element cannot leave the player retrying forever. */
+const MAX_SEEK_ATTEMPTS = 40;
 
 export interface HlsPlayerCallbacks {
   onError(message: string): void;
@@ -48,6 +52,11 @@ export class HlsVideoPlayer {
   private destroyed = false;
   private surfaceHandle?: string;
   private started = false;
+  /** Position the element should jump to once data is buffered there. */
+  private pendingSeek?: number;
+  /** Timeline position to place the next append at, after a seek. */
+  private pendingOffset?: number;
+  private seekAttempts = 0;
 
   constructor(private readonly callbacks: HlsPlayerCallbacks) {}
 
@@ -88,7 +97,7 @@ export class HlsVideoPlayer {
    * `maxBandwidth` caps variant selection so the client honours the same
    * ceiling it advertised to the server.
    */
-  async load(masterUrl: string, maxBandwidth: number): Promise<void> {
+  async load(masterUrl: string, maxBandwidth: number, startAtSeconds = 0): Promise<void> {
     // Every load gets a fresh MediaSource. Reusing one after a seek leaves the
     // old buffered timeline in place, and the element then waits forever for
     // data at a position the new stream never produces.
@@ -111,7 +120,8 @@ export class HlsVideoPlayer {
       throw new Error('The stream contains no segments.');
     }
     this.playlist = playlist;
-    this.nextSegment = 0;
+    this.nextSegment = this.segmentIndexFor(playlist, startAtSeconds);
+    this.pendingSeek = startAtSeconds > 0 ? startAtSeconds : undefined;
 
     await this.attachMediaSource();
   }
@@ -129,9 +139,6 @@ export class HlsVideoPlayer {
         try {
           const mime = mimeTypeFor(variant);
           const sourceBuffer = this.mediaSource.addSourceBuffer(mime);
-          // "segments" mode: each fragment carries its own timestamps, which
-          // is what makes seeking by segment index land in the right place.
-          sourceBuffer.mode = AppendMode.segments;
           this.queue = new AppendQueue(sourceBuffer, this.callbacks.onError);
           this.mediaSource.duration = playlist.totalDurationSeconds;
 
@@ -207,7 +214,7 @@ export class HlsVideoPlayer {
     }
 
     const bufferedEnd = this.bufferedEnd();
-    const position = this.player.currentTime ?? 0;
+    const position = this.pendingSeek ?? this.player.currentTime ?? 0;
     if (bufferedEnd - position > BUFFER_AHEAD_SECONDS) {
       return;
     }
@@ -215,7 +222,13 @@ export class HlsVideoPlayer {
     const segment = playlist.segments[this.nextSegment];
     this.nextSegment += 1;
     try {
-      this.queue.push(await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri)));
+      const bytes = await this.fetchBinary(resolveUri(this.playlistUrl, segment.uri));
+      // Only the first append of a run carries an offset; sequence mode
+      // continues the timeline for the ones after it.
+      const offset = this.pendingOffset;
+      this.pendingOffset = undefined;
+      this.queue.push(bytes, offset);
+      this.applyPendingSeek();
     } catch (error) {
       // Rewind so the segment is retried on the next tick rather than leaving
       // a hole in the timeline.
@@ -235,18 +248,76 @@ export class HlsVideoPlayer {
     }
   }
 
+  private segmentIndexFor(playlist: MediaPlaylist, seconds: number): number {
+    if (seconds <= 0) {
+      return 0;
+    }
+    const index = playlist.segments.findIndex(
+      s => seconds >= s.startSeconds && seconds < s.startSeconds + s.durationSeconds,
+    );
+    return index >= 0 ? index : Math.max(0, playlist.segments.length - 1);
+  }
+
   /**
-   * Restarts playback after the surface or stream changed.
+   * Moves playback to `targetSeconds` within the loaded playlist.
    *
-   * Seeking is deliberately *not* done by jumping to a later segment. Jellyfin
-   * transcodes a session sequentially, so asking for a segment far ahead of
-   * what it has produced simply hangs. The screen instead re-requests the
-   * stream from the server with a new start offset and calls `load` again,
-   * which is what the server is built to serve.
+   * The HLS playlist always covers the whole item -- `StartTimeTicks` does not
+   * shift it -- so seeking means dropping the buffer and resuming from the
+   * segment that covers the target, then telling the element to jump there
+   * once that data has actually landed.
    */
-  restart(): void {
-    this.started = false;
-    this.maybeStart();
+  seek(targetSeconds: number): void {
+    const playlist = this.playlist;
+    if (!playlist || !this.queue) {
+      return;
+    }
+    const target = Math.max(0, Math.min(playlist.totalDurationSeconds - 1, targetSeconds));
+    const index = this.segmentIndexFor(playlist, target);
+
+    this.queue.clear();
+    this.nextSegment = index;
+    // Place the resumed run at the segment's real start, not at the target, so
+    // the few seconds before the target stay seekable.
+    this.pendingOffset = playlist.segments[index].startSeconds;
+    this.pendingSeek = target;
+    this.seekAttempts = 0;
+    this.startPump();
+  }
+
+  /**
+   * Applies a queued seek once the buffer actually covers the target.
+   *
+   * Setting `currentTime` before the data is there is either ignored or leaves
+   * the element stalled waiting for a range that does not exist yet.
+   */
+  private applyPendingSeek(): void {
+    const target = this.pendingSeek;
+    if (target === undefined) {
+      return;
+    }
+    if (!this.bufferedCovers(target)) {
+      return;
+    }
+    try {
+      this.player.currentTime = target;
+      this.pendingSeek = undefined;
+    } catch {
+      // Retried on the next fill.
+    }
+  }
+
+  private bufferedCovers(seconds: number): boolean {
+    try {
+      const buffered = this.player.buffered;
+      for (let i = 0; i < (buffered?.length ?? 0); i += 1) {
+        if (seconds >= buffered.start(i) && seconds < buffered.end(i)) {
+          return true;
+        }
+      }
+    } catch {
+      // Treated as not buffered.
+    }
+    return false;
   }
 
   play(): void {

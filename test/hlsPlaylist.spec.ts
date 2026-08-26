@@ -55,6 +55,36 @@ describe('parseMediaPlaylist', () => {
   });
 });
 
+describe('segment lookup for seeking', () => {
+  // Mirrors HlsVideoPlayer.segmentIndexFor: seeking must resume from the
+  // segment covering the target, not from the start of the playlist.
+  const segments = parseMediaPlaylist(MEDIA).segments;
+  const indexFor = (seconds: number) => {
+    if (seconds <= 0) {
+      return 0;
+    }
+    const i = segments.findIndex(
+      s => seconds >= s.startSeconds && seconds < s.startSeconds + s.durationSeconds,
+    );
+    return i >= 0 ? i : Math.max(0, segments.length - 1);
+  };
+
+  it('resumes from the segment covering the target', () => {
+    expect(indexFor(0)).toBe(0);
+    expect(indexFor(5.9)).toBe(0);
+    expect(indexFor(6)).toBe(1);
+    expect(indexFor(9.9)).toBe(1);
+  });
+
+  it('clamps a target past the end to the last segment', () => {
+    expect(indexFor(500)).toBe(1);
+  });
+
+  it('exposes the segment start used as the timeline offset', () => {
+    expect(segments.map(s => s.startSeconds)).toEqual([0, 6]);
+  });
+});
+
 describe('resolveUri', () => {
   it('resolves against the playlist directory, ignoring its query', () => {
     expect(resolveUri('http://s:8096/videos/1/main.m3u8?a=b', 'hls1/main/0.mp4?c=d')).toBe(

@@ -216,13 +216,22 @@ Two consequences follow:
   `SourceBuffer`. Asking explicitly is what makes the manifest carry an
   `EXT-X-MAP` initialisation segment and `.mp4` fragments.
 
-**Seeking re-requests the stream.** Jellyfin transcodes a session
-sequentially, so asking for a segment far ahead of what it has produced simply
-hangs — the player waits forever for bytes the server has not reached. Seeking
-therefore asks for a *new* stream starting at the target, which is what the
-server is built to serve. The screen tracks where the current stream begins so
-the on-screen display still shows an absolute position. Changing the audio
-track works the same way.
+**Seeking happens inside the loaded playlist.** An HLS playlist always spans
+the whole item, and `StartTimeTicks` does *not* shift it — verified against
+Jellyfin 10.11, where the playlist comes back identical with and without it. So
+re-requesting the stream on a seek only ever restarts the video from the
+beginning. Instead the buffer is dropped, appending resumes from the segment
+covering the target, and the element is told to jump there.
+
+Two details make that work. The `SourceBuffer` runs in **sequence mode** with an
+explicit `timestampOffset` for the first append after a seek: Jellyfin's
+fragments start their timestamps at zero whenever it restarts a transcode, so
+trusting them would stack every segment on top of the first. And the jump is
+re-asserted after each append until the playhead agrees, because `currentTime`
+is only honoured once data is actually buffered there.
+
+Changing the audio track *is* a different stream, so that one is re-requested
+and resumed at the current position.
 
 **Subtitles are rendered by the app.** Text tracks are fetched from Jellyfin as
 WebVTT, parsed, and drawn as an overlay. Doing it here rather than asking the
