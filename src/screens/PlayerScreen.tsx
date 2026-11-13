@@ -8,6 +8,12 @@ import {PlayerMenu, type PlayerMenuState} from '../components/PlayerMenu';
 import {resolveStream} from '../api/jellyfin';
 import {HlsVideoPlayer} from '../player/hlsVideoPlayer';
 import {cueAt, parseVtt, type Cue} from '../player/subtitles';
+import {
+  isBurnedIn,
+  needsNewStream,
+  NO_SUBTITLE,
+  streamBurnsSubtitles,
+} from '../player/subtitleSelection';
 import {useApi, useApp} from '../state/AppContext';
 import {colors, radius, safeArea, spacing, typography} from '../theme/theme';
 import {episodeLabel, formatClock, secondsToTicks, ticksToSeconds} from '../utils/format';
@@ -58,6 +64,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   const [tracks, setTracks] = useState<MediaStream[]>([]);
   const [audioIndex, setAudioIndex] = useState<number | undefined>();
+  // `undefined` until the first stream answers; `NO_SUBTITLE` once switched off.
   const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>();
   const [subtitleOffset, setSubtitleOffset] = useState(0);
   const [cues, setCues] = useState<Cue[]>([]);
@@ -72,6 +79,8 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   const mediaSourceRef = useRef<string | undefined>(undefined);
   const playSessionRef = useRef<string | undefined>(undefined);
   const startedRef = useRef(false);
+  // Whether the current stream has subtitles burned into the picture.
+  const burnsSubtitlesRef = useRef(false);
   // Where the user is scrubbing to. While this is set the OSD shows it and
   // the playhead poll stands down, so the cursor does not snap back to the
   // real position between presses.
@@ -124,12 +133,15 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
         playMethodRef.current = stream.playMethod;
         mediaSourceRef.current = stream.mediaSourceId;
         playSessionRef.current = stream.playSessionId;
+        burnsSubtitlesRef.current = streamBurnsSubtitles(stream.url);
         setTracks(stream.mediaStreams);
         // Adopt the server's defaults once, so the menu opens showing what is
         // actually playing rather than "None".
         setAudioIndex(current => current ?? stream.defaultAudioIndex);
         setSubtitleIndex(current =>
-          current ?? (subtitle === undefined ? stream.defaultSubtitleIndex : subtitle),
+          subtitle !== undefined
+            ? subtitle
+            : current ?? stream.defaultSubtitleIndex ?? NO_SUBTITLE,
         );
 
         if (stream.isDirect) {
@@ -244,7 +256,7 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   useEffect(() => {
     const track = subtitleTracks.find(t => t.Index === subtitleIndex);
     const source = mediaSourceRef.current;
-    if (!track || !source || track.IsTextSubtitleStream === false) {
+    if (!track || !source || isBurnedIn(track)) {
       setCues([]);
       return;
     }
@@ -308,13 +320,20 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
 
   // Reports the final position on the way out. Without this the server keeps
   // the session open and "Continue Watching" never updates.
+  //
+  // This must run on unmount only. It used to depend on `reportBody`, which
+  // changes with the audio and subtitle selection, so picking a track reported
+  // the playback as stopped: the server then killed the transcode, and the
+  // next segments answered 404 until the player gave up.
+  const reportBodyRef = useRef(reportBody);
+  reportBodyRef.current = reportBody;
   useEffect(
     () => () => {
       if (startedRef.current) {
-        api.reportPlaybackStopped(reportBody()).catch(() => undefined);
+        api.reportPlaybackStopped(reportBodyRef.current()).catch(() => undefined);
       }
     },
-    [api, reportBody],
+    [api],
   );
 
   // --- Controls -----------------------------------------------------------
@@ -380,18 +399,21 @@ export const PlayerScreen = ({itemId, startPositionTicks = 0, mediaSourceId, onE
   );
 
   const selectSubtitle = useCallback(
-    (index: number | undefined) => {
-      setSubtitleIndex(index);
+    (choice: number | undefined) => {
+      const index = choice ?? NO_SUBTITLE;
       setMenu('closed');
-      const track = subtitleTracks.find(t => t.Index === index);
-      // A picture-based track has to be burned in by the server, which needs a
-      // new stream. A text track is fetched separately, so the video keeps
-      // playing untouched.
-      if (track && track.IsTextSubtitleStream === false) {
+      if (index === subtitleIndex) {
+        return;
+      }
+      setSubtitleIndex(index);
+      // A text track is fetched separately and drawn by the app, so the video
+      // keeps playing untouched. Burning a track in, or getting rid of one that
+      // is burned in, changes the picture itself and needs a new stream.
+      if (needsNewStream(subtitleTracks, burnsSubtitlesRef.current, index)) {
         void openStream(positionRef.current, audioIndex, index);
       }
     },
-    [audioIndex, openStream, subtitleTracks],
+    [audioIndex, openStream, subtitleIndex, subtitleTracks],
   );
 
   useTVEventHandler((event: HWEvent) => {

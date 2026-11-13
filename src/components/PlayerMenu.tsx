@@ -88,7 +88,13 @@ export const PlayerMenu = ({
             : 'Playback settings'}
         </Text>
 
-        <TVFocusGuideView autoFocus trapFocusLeft trapFocusRight>
+        {/*
+          Keyed by pane so each one gets a fresh container. Swapping the rows
+          inside a single guide left the platform's focus engine navigating the
+          rows of the first pane: in a sub-pane the D-pad could not leave the
+          first entry, so no other track could be picked.
+        */}
+        <TVFocusGuideView autoFocus key={state} trapFocusLeft trapFocusRight>
           <ScrollView contentContainerStyle={styles.list}>
             {state === 'root' ? (
               <>
@@ -131,7 +137,7 @@ export const PlayerMenu = ({
                   autoFocus
                   label="Off"
                   onPress={() => onSelectSubtitle(undefined)}
-                  selected={subtitleIndex === undefined}
+                  selected={subtitleIndex === undefined || subtitleIndex < 0}
                 />
                 {subtitleTracks.map(track => (
                   <Row
@@ -206,7 +212,7 @@ interface RowProps {
 }
 
 const Row = ({label, value, onPress, selected, disabled, autoFocus}: RowProps) => (
-  <Focusable autoFocus={autoFocus} disabled={disabled} onPress={onPress}>
+  <Focusable accessibilityLabel={label} autoFocus={autoFocus} disabled={disabled} onPress={onPress}>
     {focused => (
       <View style={[styles.row, focused && styles.rowFocused, disabled && styles.rowDisabled]}>
         <Text style={[styles.rowLabel, focused && styles.rowLabelFocused]} numberOfLines={1}>

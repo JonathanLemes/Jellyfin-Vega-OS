@@ -64,6 +64,11 @@ export interface MediaStream {
   Width?: number;
   Channels?: number;
   DeliveryUrl?: string;
+  /**
+   * How the server will deliver this subtitle track under the device profile
+   * sent with `PlaybackInfo`; `Encode` means burned into the video.
+   */
+  DeliveryMethod?: 'Encode' | 'Embed' | 'External' | 'Hls' | 'Drop';
   IsTextSubtitleStream?: boolean;
 }
 

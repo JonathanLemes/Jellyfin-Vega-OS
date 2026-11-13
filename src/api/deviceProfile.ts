@@ -236,14 +236,22 @@ export function buildDeviceProfile(options: ProfileOptions = {}): DeviceProfile 
         Context: 'Streaming',
       },
     ],
-    // Text subtitles are fetched and rendered by the app; picture-based formats
-    // have no client-side renderer here, so the server burns them in.
+    // Text subtitles are fetched as WebVTT and rendered by the app; picture-
+    // based formats have no client-side renderer here, so the server burns them
+    // in. ASS/SSA are text too: the server converts them to WebVTT (losing the
+    // styling), which beats burning them in -- that forces a full video
+    // transcode, and the track can then only be changed by restarting the
+    // stream.
     SubtitleProfiles: [
       {Format: 'vtt', Method: 'External'},
       {Format: 'subrip', Method: 'External'},
       {Format: 'srt', Method: 'External'},
-      {Format: 'ass', Method: 'Encode'},
-      {Format: 'ssa', Method: 'Encode'},
+      // MP4's own text format. Without an entry the server falls back to
+      // burning it in, which is what made the tracks of MP4 files unswitchable.
+      {Format: 'mov_text', Method: 'External'},
+      {Format: 'webvtt', Method: 'External'},
+      {Format: 'ass', Method: 'External'},
+      {Format: 'ssa', Method: 'External'},
       {Format: 'pgssub', Method: 'Encode'},
       {Format: 'dvdsub', Method: 'Encode'},
     ],
