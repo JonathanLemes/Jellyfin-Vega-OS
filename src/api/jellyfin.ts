@@ -43,20 +43,36 @@ const IMAGE_TYPES = ['Primary', 'Backdrop', 'Thumb', 'Logo'];
  * holds no UI state; screens own their own loading and error handling.
  */
 export class JellyfinApi {
-  constructor(readonly session: Session, readonly identity: DeviceIdentity) {}
+  /**
+   * @param onUnauthorized called when the server rejects the stored token
+   *   (revoked, or the server's database was reset), so the app can drop the
+   *   session instead of showing "Try again" on every screen forever.
+   */
+  constructor(
+    readonly session: Session,
+    readonly identity: DeviceIdentity,
+    private readonly onUnauthorized?: () => void,
+  ) {}
 
-  private call<T>(
+  private async call<T>(
     path: string,
     query?: Record<string, unknown>,
     method: 'GET' | 'POST' | 'DELETE' = 'GET',
     body?: unknown,
   ): Promise<T> {
-    return request<T>(this.session.serverUrl, path, this.identity, {
-      method,
-      query: query as never,
-      body,
-      token: this.session.accessToken,
-    });
+    try {
+      return await request<T>(this.session.serverUrl, path, this.identity, {
+        method,
+        query: query as never,
+        body,
+        token: this.session.accessToken,
+      });
+    } catch (error) {
+      if (error instanceof JellyfinError && error.status === 401) {
+        this.onUnauthorized?.();
+      }
+      throw error;
+    }
   }
 
   /** Libraries visible to the signed-in user, in the server's configured order. */

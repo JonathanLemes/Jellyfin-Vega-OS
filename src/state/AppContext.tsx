@@ -92,9 +92,16 @@ export const AppProvider = ({children}: {children: React.ReactNode}) => {
     };
   }, []);
 
+  // A rejected token only clears the session. Remembered credentials stay, so
+  // the sign-in screen replays them and the user lands back where they were.
+  const expireSession = useCallback(() => {
+    clearSession().catch(() => undefined);
+    setSession(undefined);
+  }, []);
+
   const api = useMemo(
-    () => (session && identity ? new JellyfinApi(session, identity) : undefined),
-    [session, identity],
+    () => (session && identity ? new JellyfinApi(session, identity, expireSession) : undefined),
+    [session, identity, expireSession],
   );
 
   const value = useMemo<AppState>(
